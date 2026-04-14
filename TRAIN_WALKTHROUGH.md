@@ -16,6 +16,26 @@ The script does 7 things in order:
 6. Run the training loop (the core learning process)
 7. Save the trained LoRA weights
 
+### The Workflow in Plain English
+
+**Step 1: Read the recipe card.** We start with `metadata.jsonl` — each line is like a recipe card that says: "Here are 10 photos of someone's face, here's the audio clip, and the answer is SPEAKING."
+
+**Step 2: Build a question for the model.** We format this into a conversation, like texting the model: "Here are some face photos and an audio clip. Is this person speaking?" And we include the correct answer so the model can learn from it.
+
+**Step 3: Translate everything into numbers.** The model can't see images or hear audio — it only understands numbers. Face photos become grids of numbers (like how a digital photo is really just RGB values). Audio becomes a sequence of numbers (like how a WAV file is amplitude values over time). Text becomes token IDs (each word = a number). All of these get **stitched into one single sequence** — images and audio interleaved together, not processed separately.
+
+**Step 4: The model thinks (forward pass).** This combined sequence goes through the model's transformer layers. At each layer, the model uses **self-attention** — every element can "look at" every other element. The audio numbers attend to the face image numbers and vice versa. This is how the model figures out: "the lips are moving in sync with the audio" = SPEAKING, or "the lips are still but there's audio" = NOT_SPEAKING. It's all processed together as one unified stream, not audio-branch + video-branch combined at the end.
+
+**Step 5: Grade the answer (loss).** The model predicts "SPEAKING" or "NOT_SPEAKING." We compare it to the correct answer. If the model was confident and right, the loss is low (good). If it was wrong, the loss is high (bad). The loss is just one number: how wrong was it.
+
+**Step 6: Figure out who's responsible (backward pass).** The loss flows backward through the model. For each of the ~3 million LoRA parameters, we calculate: "if I nudge this number up or down, does the loss go up or down?" These are the gradients — a direction for improvement.
+
+**Step 7: Nudge the weights (optimizer step).** Each LoRA parameter gets nudged slightly in the direction that reduces the loss. Imagine 3 million tiny dials, and we turn each one a tiny bit. The model is now slightly better at detecting active speakers.
+
+**Step 8: Repeat.** Do this for every training sample (e.g. 2000) x 3 passes (epochs) = 6000 times total. Each time, the model gets a little better.
+
+**Step 9: Save.** Save those 3 million tuned dial positions to a file (~10-50MB). To use it later, load the original Qwen model + your adapter = a model that's good at active speaker detection.
+
 ---
 
 ## 1. Imports (Lines 13–30)
