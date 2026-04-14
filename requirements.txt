@@ -1,0 +1,30 @@
+# Qwen2.5-Omni requires a special transformers build
+# Install with: pip install git+https://github.com/huggingface/transformers@v4.51.3-Qwen2.5-Omni-preview
+# Do NOT install transformers from PyPI — it won't have Qwen2.5-Omni support
+
+# Core ML
+torch>=2.1.0
+torchaudio>=2.1.0
+accelerate>=0.27.0
+
+# LoRA / PEFT
+peft>=0.10.0
+
+# Qwen2.5-Omni utilities (handles multimodal input processing)
+qwen-omni-utils[decord]
+
+# Data handling
+datasets>=2.18.0
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Audio/Image processing
+soundfile>=0.12.0
+Pillow>=10.0.0
+librosa>=0.10.0
+
+# Evaluation
+scikit-learn>=1.3.0
+
+# Logging
+tqdm>=4.65.0

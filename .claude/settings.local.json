@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:github.com)",
+      "WebSearch",
+      "Bash(chmod +x \"/Users/ww/Desktop/NEU/CS6140_machine learning/Final Project/fine-tuning-qwen/train.sh\" \"/Users/ww/Desktop/NEU/CS6140_machine learning/Final Project/fine-tuning-qwen/evaluate.sh\" \"/Users/ww/Desktop/NEU/CS6140_machine learning/Final Project/fine-tuning-qwen/setup_env.sh\")"
+    ]
+  }
+}
