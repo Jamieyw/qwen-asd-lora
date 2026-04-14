@@ -27,7 +27,8 @@ echo "========================================"
 
 module load cuda/12.1 2>/dev/null || module load cuda 2>/dev/null
 module load anaconda3 2>/dev/null || module load miniconda 2>/dev/null
-source activate qwen-asd 2>/dev/null || conda activate qwen-asd
+eval "$(conda shell.bash hook)"
+conda activate qwen-asd
 
 nvidia-smi
 

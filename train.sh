@@ -33,13 +33,14 @@ echo "Start time: $(date)"
 echo "Working dir: $(pwd)"
 echo "========================================"
 
-# Load modules — ADJUST THESE to match your cluster
-# Run 'module avail' on your cluster to see what's available
+# Load modules
 module load cuda/12.1 2>/dev/null || module load cuda 2>/dev/null || echo "No cuda module found"
 module load anaconda3 2>/dev/null || module load miniconda 2>/dev/null || echo "No conda module found"
 
-# Activate conda environment
-source activate qwen-asd 2>/dev/null || conda activate qwen-asd
+# Properly initialize and activate conda
+# (sbatch doesn't source .bashrc, so conda activate won't work without this)
+eval "$(conda shell.bash hook)"
+conda activate qwen-asd
 
 # Print environment info
 echo ""
