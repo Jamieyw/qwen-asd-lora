@@ -37,6 +37,56 @@ Fine-tune [Qwen2.5-Omni-3B](https://huggingface.co/Qwen/Qwen2.5-Omni-3B) using L
 
 We use **~2,000 training tracks (~5%)** with 10 frames each, plus 500 validation tracks, to keep training under 4 hours.
 
+### Prepared Data Structure
+
+After running `prepare_data.py`, the `asd-data/` folder looks like this:
+
+```
+asd-data/
+├── train/
+│   ├── metadata.jsonl              # one JSON line per entity track
+│   ├── images/                     # face crop JPGs
+│   │   ├── DGyuHzlne6A_4287_frame000.jpg
+│   │   ├── DGyuHzlne6A_4287_frame001.jpg
+│   │   └── ...                     # up to 10 frames per entity
+│   └── audio/                      # audio WAVs
+│       ├── DGyuHzlne6A_4287.wav
+│       └── ...
+└── val/
+    ├── metadata.jsonl
+    ├── images/
+    └── audio/
+```
+
+- **`images/`** — Face crops from video frames. Each JPG is one person's face at one timestamp. Naming: `{videoID}_{trackNum}_frame{N}.jpg`. Up to 10 evenly-spaced frames per track.
+- **`audio/`** — The audio segment for each entity track. One WAV per person, covering the time window of their face track.
+- **`metadata.jsonl`** — Ties everything together. Each line is one training sample:
+
+```json
+{
+  "entity_id": "DGyuHzlne6A:4287",
+  "image_paths": ["asd-data/train/images/DGyuHzlne6A_4287_frame000.jpg", "..."],
+  "audio_path": "asd-data/train/audio/DGyuHzlne6A_4287.wav",
+  "timestamps": [0.16, 0.32, 0.48],
+  "labels": [1, 1, 0, 0, 1, 1, 0, 0, 1, 1],
+  "majority_label": "SPEAKING",
+  "num_frames": 10,
+  "speaking_ratio": 0.6
+}
+```
+
+### How Data Becomes a Training Sample
+
+The training script reads each metadata line and builds a multimodal conversation for Qwen2.5-Omni:
+
+| Role | Content |
+|------|---------|
+| **System** | "You are an active speaker detection system..." |
+| **User** | [face_frame1.jpg] [face_frame2.jpg] ... [audio.wav] + "Is this person speaking?" |
+| **Assistant** | "SPEAKING" or "NOT_SPEAKING" |
+
+The model learns to look at lip movements in the face crops, listen to the audio, and determine if this specific person is the one talking.
+
 ## LoRA Configuration
 
 | Parameter | Value |
