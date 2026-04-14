@@ -4,14 +4,14 @@
 #
 # Submit with:  sbatch evaluate.sh
 # Or run interactively with:
-#   srun --partition=gpu --gres=gpu:v100:1 --mem=32G --time=00:30:00 --pty bash
+#   srun --partition=gpu --gres=gpu:a100:1 --mem=32G --time=00:30:00 --pty bash
 #   conda activate qwen-asd
 #   python evaluate.py
 ###############################################################################
 
 #SBATCH --job-name=qwen-eval
 #SBATCH --partition=gpu
-#SBATCH --gres=gpu:v100:1
+#SBATCH --gres=gpu:a100:1
 #SBATCH --mem=32G
 #SBATCH --cpus-per-task=2
 #SBATCH --time=01:00:00
@@ -39,7 +39,6 @@ python evaluate.py \
     --adapter_path ./output/best_model \
     --data_dir ./data \
     --output_dir ./output \
-    --fp16
 
 # Run baseline evaluation (without adapter) for comparison
 echo ""

@@ -10,7 +10,7 @@
 
 #SBATCH --job-name=qwen-asd            # Job name (shows in squeue)
 #SBATCH --partition=gpu                 # GPU partition — adjust if your cluster uses a different name
-#SBATCH --gres=gpu:v100:1              # Request 1 V100 GPU (32GB). Change to gpu:1 if v100 syntax doesn't work
+#SBATCH --gres=gpu:a100:1              # Request 1 A100 GPU (40GB). Fastest available on Explorer
 #SBATCH --mem=64G                       # RAM (need enough for data loading + model)
 #SBATCH --cpus-per-task=4               # CPU cores for data loading workers
 #SBATCH --time=04:00:00                 # 4 hour time limit
@@ -77,7 +77,6 @@ python train.py \
     --logging_steps 10 \
     --save_steps 500 \
     --timing_test_steps 50 \
-    --fp16 \
     --gradient_checkpointing
 
 echo ""
