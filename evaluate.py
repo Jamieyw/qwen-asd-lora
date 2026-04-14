@@ -18,6 +18,7 @@ import torch
 from peft import PeftModel
 from sklearn.metrics import (
     accuracy_score,
+    average_precision_score,
     classification_report,
     confusion_matrix,
     f1_score,
@@ -198,6 +199,7 @@ def evaluate(args):
     ground_truths = []     # track-level overall ground truths
     all_frame_preds = []   # per-frame predictions (across all samples)
     all_frame_gts = []     # per-frame ground truths
+    per_track_results = [] # list of (track_preds, track_gts) for mAP
     raw_outputs = []
 
     print(f"\nRunning inference on {len(samples)} samples...")
@@ -258,10 +260,16 @@ def evaluate(args):
             frame_gts = sample["labels"]
 
             # Collect per-frame results
+            track_fp = []
+            track_fg = []
             for fp, fg in zip(frame_preds, frame_gts):
                 if fp != -1:  # only count parseable predictions
                     all_frame_preds.append(fp)
                     all_frame_gts.append(fg)
+                    track_fp.append(fp)
+                    track_fg.append(fg)
+            if track_fp:
+                per_track_results.append((track_fp, track_fg))
 
             # Track overall (track-level) predictions
             predictions.append(overall_pred)
@@ -331,10 +339,38 @@ def evaluate(args):
             digits=4,
         ))
 
+        # Frame-level mAP (AP across all frames globally)
+        try:
+            frame_mAP = average_precision_score(all_frame_gts, all_frame_preds)
+            print(f"Frame mAP: {frame_mAP:.4f}")
+        except ValueError:
+            frame_mAP = None
+            print(f"Frame mAP: N/A (need both classes in ground truth)")
+
+        # Track-level mAP (AP per track, then average — standard ASD metric)
+        per_track_aps = []
+        for t_preds, t_gts in per_track_results:
+            if len(set(t_gts)) > 1:  # need both classes to compute AP
+                ap = average_precision_score(t_gts, t_preds)
+                per_track_aps.append(ap)
+        if per_track_aps:
+            track_mAP = np.mean(per_track_aps)
+            print(f"Track mAP: {track_mAP:.4f} (computed over {len(per_track_aps)}/{len(per_track_results)} tracks)")
+        else:
+            track_mAP = None
+            print(f"Track mAP: N/A (no tracks had both speaking and not-speaking frames)")
+
+        print(f"\nNote: mAP is computed with binary predictions (0/1), not confidence")
+        print(f"scores, since we use a generative model. This is a lower bound on")
+        print(f"what mAP would be with continuous probability scores.")
+
         results["frame_accuracy"] = frame_acc
         results["frame_precision"] = frame_prec
         results["frame_recall"] = frame_rec
         results["frame_f1"] = frame_f1
+        results["frame_mAP"] = frame_mAP
+        results["track_mAP"] = track_mAP
+        results["track_mAP_num_tracks"] = len(per_track_aps)
         results["frame_confusion_matrix"] = frame_cm.tolist()
         results["total_frames_evaluated"] = len(all_frame_preds)
 
