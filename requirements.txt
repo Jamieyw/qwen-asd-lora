@@ -7,8 +7,8 @@ torch>=2.1.0
 torchaudio>=2.1.0
 accelerate>=0.27.0
 
-# LoRA / PEFT
-peft>=0.10.0
+# LoRA / PEFT (pin to 0.13.x — newer versions require PyTorch float8 types not available on all clusters)
+peft>=0.10.0,<0.14.0
 
 # Qwen2.5-Omni utilities (handles multimodal input processing)
 qwen-omni-utils[decord]

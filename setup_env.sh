@@ -49,7 +49,7 @@ pip install git+https://github.com/huggingface/transformers@v4.51.3-Qwen2.5-Omni
 echo ""
 echo "Installing remaining dependencies..."
 pip install accelerate>=0.27.0
-pip install peft>=0.10.0
+pip install "peft>=0.10.0,<0.14.0"
 pip install "qwen-omni-utils[decord]"
 pip install datasets>=2.18.0
 pip install pandas numpy
