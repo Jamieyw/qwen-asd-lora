@@ -47,72 +47,182 @@ We use **~2,000 training tracks (~5%)** with 10 frames each, plus 500 validation
 | Target modules | q_proj, k_proj, v_proj, o_proj |
 | Trainable params | ~3M / 3B (~0.1%) |
 
-## Quick Start (Local Testing)
+## Running on NEU Explorer Cluster (Step-by-Step)
+
+Complete walkthrough from SSH login to finished evaluation.
+
+### Step 1: SSH into the cluster
 
 ```bash
-# Install dependencies
-pip install git+https://github.com/huggingface/transformers@v4.51.3-Qwen2.5-Omni-preview
-pip install -r requirements.txt
-
-# Prepare a small data subset
-python prepare_data.py --num_samples 100 --val_samples 20
-
-# Train (requires GPU)
-python train.py --epochs 1 --timing_test_steps 0 --fp16
+ssh your_username@login.explorer.northeastern.edu
 ```
 
-## Running on SLURM Cluster (NEU Explorer)
-
-### 1. Transfer files
+### Step 2: Check available GPUs
 
 ```bash
-scp -r ./* your_username@explorer.northeastern.edu:~/qwen-asd/
+sinfo -p gpu --Format=gres:25,gresused:25,nodes:7,cpus:7,nodelist:50
 ```
 
-### 2. Set up environment
+This shows all GPU types and how many are free. Look for GPUs with available slots (where `GRES_USED` is less than `GRES`). Speed ranking:
+
+| GPU | VRAM | Speed | Notes |
+|-----|------|-------|-------|
+| H200 | 141GB | Fastest | Often fully used, long queue |
+| **A100** | **40GB** | **Fast** | **Best balance of speed and availability** |
+| V100-SXM2 | 32GB | Good | Decent fallback |
+| V100-PCIe | 32GB | OK | Slower V100 variant |
+| T4 | 16GB | Slowest | Too small for this model |
+
+Pick the fastest GPU that has free slots, then update `train.sh` and `evaluate.sh` to match. For example, if you pick A100:
 
 ```bash
-ssh your_username@explorer.northeastern.edu
+# In train.sh, the line should be:
+#SBATCH --gres=gpu:a100:1
+
+# In evaluate.sh, same:
+#SBATCH --gres=gpu:a100:1
+```
+
+A100 and H200 support **bf16 natively** (no `--fp16` flag needed). If using V100, add `--fp16` to the python command in `train.sh`.
+
+### Step 3: Create project directory on cluster
+
+```bash
+mkdir -p ~/qwen-asd/logs
+```
+
+### Step 4: Transfer files from your local machine
+
+Open a **new terminal on your Mac** (not the SSH session). `cd` into the project folder first:
+
+```bash
+cd /path/to/fine-tuning-qwen
+scp *.py *.sh *.txt *.md your_username@login.explorer.northeastern.edu:~/qwen-asd/
+```
+
+This sends only the code files (~60KB), not data. Data gets downloaded directly on the cluster later.
+
+### Step 5: Set up conda environment
+
+Back in your **SSH session on the cluster**:
+
+```bash
+# Request an interactive compute node (don't install on the login node)
 srun --partition=short --mem=8G --time=01:00:00 --pty bash
+
+# Go to your project
 cd ~/qwen-asd
+
+# Load conda and initialize it (first time only)
+module load anaconda3
+conda init
+source ~/.bashrc
+
+# Run the setup script (creates conda env + installs all dependencies)
 bash setup_env.sh
+
+# Activate the environment
+conda activate qwen-asd
 ```
 
-### 3. Prepare data
+Verify everything works:
 
 ```bash
-conda activate qwen-asd
+python -c "import torch; print(f'PyTorch: {torch.__version__}, CUDA: {torch.cuda.is_available()}')"
+python -c "from transformers import Qwen2_5OmniForConditionalGeneration; print('Model class: OK')"
+```
+
+### Step 6: Download and prepare data subset
+
+Still in the interactive session:
+
+```bash
 python prepare_data.py
 ```
 
-### 4. Submit training job
+This downloads CSVs + audio + images from HuggingFace and samples ~2,000 training tracks (~5% of data). Takes ~10-30 minutes depending on network speed.
+
+### Step 7: Submit the training job
 
 ```bash
 sbatch train.sh
+# Output: "Submitted batch job 1234567"
 ```
 
-### 5. Monitor
+This puts your job in the SLURM queue. It will run on a GPU node when one becomes available.
+
+### Step 8: Monitor the job
 
 ```bash
-squeue -u $USER              # check job status
-tail -f logs/<job_id>.out    # follow output
+# Check job status
+squeue -u $USER
 ```
 
-### 6. Evaluate
+Status codes:
+| Code | Meaning |
+|------|---------|
+| `PD` | Pending — waiting in queue for a GPU |
+| `R` | Running — training is in progress |
+| `CG` | Completing — job is finishing up |
+| (gone) | Job finished (check logs for results) |
+
+The `REASON` column explains why a job is pending:
+- `(Priority)` — other higher-priority jobs are ahead of you
+- `(Resources)` — waiting for the requested GPU type to free up
+
+```bash
+# Once the job is running (status = R), watch the output live:
+tail -f logs/1234567.out
+
+# Check for errors:
+cat logs/1234567.err
+
+# Cancel a job if needed:
+scancel 1234567
+```
+
+The first thing the training script does is a **50-step timing test** that estimates total training time. If it says >4 hours, cancel and reduce data.
+
+### Step 9: Submit evaluation job (after training completes)
 
 ```bash
 sbatch evaluate.sh
 ```
 
+This runs evaluation twice: once with the LoRA adapter (fine-tuned model) and once without (baseline), so you can compare the improvement.
+
+```bash
+# Check eval results when done:
+cat logs/<eval_job_id>.out
+
+# Or read the JSON results:
+cat output/eval_results.json
+```
+
+### Quick Reference: Useful Commands
+
+```bash
+squeue -u $USER              # list your jobs
+sinfo -p gpu                 # see GPU partition info
+scancel <job_id>             # cancel a job
+cat logs/<job_id>.out        # view job output
+cat logs/<job_id>.err        # view job errors
+tail -f logs/<job_id>.out    # follow output live (Ctrl+C to stop)
+nvidia-smi                   # check GPU usage (on compute node)
+du -sh ~/qwen-asd/data/      # check data size
+```
+
+---
+
 ## Training Details
 
 - **Model:** Qwen2.5-Omni-3B (3 billion parameters, multimodal)
 - **Method:** LoRA via PEFT library applied to the thinker component
-- **GPU:** V100 32GB (fp16) or H200
+- **GPU:** A100 40GB (bf16) — also works on V100 32GB (fp16) or H200
 - **Effective batch size:** 8 (batch_size=1 x gradient_accumulation=8)
 - **Epochs:** 3
 - **Learning rate:** 2e-4 with linear warmup
-- **Estimated training time:** ~2-4 hours on V100
+- **Estimated training time:** ~2-4 hours on A100
 
 The training script includes a **50-step timing test** at startup that estimates total training time before committing to the full run.
 
