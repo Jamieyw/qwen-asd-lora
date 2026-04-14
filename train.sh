@@ -64,7 +64,7 @@ echo "========================================"
 
 python train.py \
     --model_name "Qwen/Qwen2.5-Omni-3B" \
-    --data_dir ./data \
+    --data_dir ./asd-data \
     --output_dir ./output \
     --epochs 3 \
     --batch_size 1 \

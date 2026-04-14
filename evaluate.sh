@@ -37,7 +37,7 @@ echo "Evaluating fine-tuned model..."
 python evaluate.py \
     --model_name "Qwen/Qwen2.5-Omni-3B" \
     --adapter_path ./output/best_model \
-    --data_dir ./data \
+    --data_dir ./asd-data \
     --output_dir ./output \
 
 # Run baseline evaluation (without adapter) for comparison
@@ -45,7 +45,7 @@ echo ""
 echo "Evaluating baseline (no adapter)..."
 python evaluate.py \
     --model_name "Qwen/Qwen2.5-Omni-3B" \
-    --data_dir ./data \
+    --data_dir ./asd-data \
     --output_dir ./output \
     --fp16 \
     --no_adapter
