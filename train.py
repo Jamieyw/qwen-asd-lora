@@ -68,11 +68,14 @@ def parse_args():
 
 class ASDDataset(Dataset):
     """
-    Active Speaker Detection dataset.
+    Active Speaker Detection dataset with per-frame labels.
 
     Each sample is formatted as a conversation for Qwen2.5-Omni:
-    - User: [face images] + [audio] + "Is this person speaking?"
-    - Assistant: "SPEAKING" or "NOT_SPEAKING"
+    - User: [face images] + [audio] + "For each frame, is this person speaking?"
+    - Assistant: "Frame 1: SPEAKING\nFrame 2: NOT_SPEAKING\n..." (per-frame labels)
+
+    This forces the model to actually analyze each frame rather than
+    taking shortcuts with a single-token answer.
     """
 
     def __init__(self, data_dir, split="train"):
@@ -98,11 +101,10 @@ class ASDDataset(Dataset):
         entry = self.metadata[idx]
 
         # Build conversation in Qwen2.5-Omni format
-        # Content includes images + audio + text question
         user_content = []
 
         # Add face crop images (already saved as JPG)
-        for img_path in entry["image_paths"]:
+        for i, img_path in enumerate(entry["image_paths"]):
             user_content.append({
                 "type": "image",
                 "image": img_path,
@@ -114,24 +116,43 @@ class ASDDataset(Dataset):
             "audio": entry["audio_path"],
         })
 
-        # Add the question
+        # Add the question — ask for per-frame analysis
+        num_frames = entry["num_frames"]
         user_content.append({
             "type": "text",
             "text": (
-                "Look at these face images and listen to the audio. "
-                "Is this person currently speaking? "
-                "Answer with SPEAKING or NOT_SPEAKING."
+                f"These are {num_frames} sequential frames of a person's face "
+                f"extracted from a video, along with the corresponding audio. "
+                f"For each frame, determine whether this person is actively speaking "
+                f"at that moment by analyzing their lip movements and the audio. "
+                f"Output one line per frame in the format: Frame N: SPEAKING or NOT_SPEAKING"
             ),
         })
+
+        # Build per-frame answer string
+        # e.g. "Frame 1: SPEAKING\nFrame 2: NOT_SPEAKING\n..."
+        labels = entry["labels"]
+        answer_lines = []
+        for i, label in enumerate(labels):
+            status = "SPEAKING" if label == 1 else "NOT_SPEAKING"
+            answer_lines.append(f"Frame {i+1}: {status}")
+        answer_text = "\n".join(answer_lines)
+
+        # Also add overall summary
+        speaking_count = sum(labels)
+        total = len(labels)
+        overall = "SPEAKING" if speaking_count > total / 2 else "NOT_SPEAKING"
+        answer_text += f"\nOverall: {overall} ({speaking_count}/{total} frames)"
 
         conversation = [
             {
                 "role": "system",
                 "content": [{"type": "text", "text": (
                     "You are an active speaker detection system. "
-                    "Given face images and audio from a video, determine whether "
-                    "the person shown is the one speaking. "
-                    "Respond with only SPEAKING or NOT_SPEAKING."
+                    "Given sequential face images and audio from a video, "
+                    "analyze each frame to determine whether the person is "
+                    "speaking at that moment. Look at lip movements across frames "
+                    "and match them with the audio signal."
                 )}],
             },
             {
@@ -140,13 +161,15 @@ class ASDDataset(Dataset):
             },
             {
                 "role": "assistant",
-                "content": [{"type": "text", "text": entry["majority_label"]}],
+                "content": [{"type": "text", "text": answer_text}],
             },
         ]
 
         return {
             "conversation": conversation,
-            "label": entry["majority_label"],
+            "label": answer_text,
+            "labels": labels,
+            "majority_label": entry["majority_label"],
             "entity_id": entry["entity_id"],
         }
 
