@@ -325,11 +325,12 @@ def train(args):
         task_type=TaskType.CAUSAL_LM,
     )
 
-    # The thinker's config is missing vocab_size (it's on the parent config).
-    # The loss function inside the thinker needs it, so copy it over.
+    # The thinker's config is missing vocab_size, which the loss function needs.
+    # Get it from the embedding layer (always reliable).
     if not hasattr(model.thinker.config, "vocab_size"):
-        model.thinker.config.vocab_size = model.config.thinker_config.vocab_size
-        print(f"Set thinker vocab_size = {model.thinker.config.vocab_size}")
+        vocab_size = model.thinker.lm_head.out_features
+        model.thinker.config.vocab_size = vocab_size
+        print(f"Set thinker vocab_size = {vocab_size}")
 
     # Apply LoRA specifically to the thinker (text generation) component
     model.thinker = get_peft_model(model.thinker, lora_config)
