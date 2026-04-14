@@ -18,15 +18,15 @@ The script does 7 things in order:
 
 ### The Workflow in Plain English
 
-**Step 1: Read the recipe card.** We start with `metadata.jsonl` — each line is like a recipe card that says: "Here are 10 photos of someone's face, here's the audio clip, and the answer is SPEAKING."
+**Step 1: Read the recipe card.** We start with `metadata.jsonl` — each line is like a recipe card that says: "Here are 10 photos of someone's face, here's the audio clip, and here are the per-frame labels (which frames are speaking, which aren't)."
 
-**Step 2: Build a question for the model.** We format this into a conversation, like texting the model: "Here are some face photos and an audio clip. Is this person speaking?" And we include the correct answer so the model can learn from it.
+**Step 2: Build a question for the model.** We format this into a conversation, like texting the model: "Here are 10 sequential face photos and an audio clip. For each frame, tell me if this person is speaking." And we include the correct per-frame answers so the model can learn from them.
 
 **Step 3: Translate everything into numbers.** The model can't see images or hear audio — it only understands numbers. Face photos become grids of numbers (like how a digital photo is really just RGB values). Audio becomes a sequence of numbers (like how a WAV file is amplitude values over time). Text becomes token IDs (each word = a number). All of these get **stitched into one single sequence** — images and audio interleaved together, not processed separately.
 
 **Step 4: The model thinks (forward pass).** This combined sequence goes through the model's transformer layers. At each layer, the model uses **self-attention** — every element can "look at" every other element. The audio numbers attend to the face image numbers and vice versa. This is how the model figures out: "the lips are moving in sync with the audio" = SPEAKING, or "the lips are still but there's audio" = NOT_SPEAKING. It's all processed together as one unified stream, not audio-branch + video-branch combined at the end.
 
-**Step 5: Grade the answer (loss).** The model predicts "SPEAKING" or "NOT_SPEAKING." We compare it to the correct answer. If the model was confident and right, the loss is low (good). If it was wrong, the loss is high (bad). The loss is just one number: how wrong was it.
+**Step 5: Grade the answer (loss).** The model predicts per-frame labels ("Frame 1: SPEAKING\nFrame 2: NOT_SPEAKING\n..."). We compare each predicted token to the correct answer. If the model was confident and right, the loss is low (good). If it was wrong, the loss is high (bad). With ~30+ tokens of output per sample, the model gets meaningful feedback on every frame.
 
 **Step 6: Figure out who's responsible (backward pass).** The loss flows backward through the model. For each of the ~3 million LoRA parameters, we calculate: "if I nudge this number up or down, does the loss go up or down?" These are the gradients — a direction for improvement.
 
@@ -112,7 +112,7 @@ When the DataLoader asks for sample #42, this function builds a **conversation**
 conversation = [
     {
         "role": "system",
-        "content": [{"type": "text", "text": "You are an active speaker detection system..."}]
+        "content": [{"type": "text", "text": "You are an active speaker detection system. Analyze each frame..."}]
     },
     {
         "role": "user",
@@ -121,15 +121,17 @@ conversation = [
             {"type": "image", "image": "path/to/face_frame001.jpg"},
             # ... up to 10 face images
             {"type": "audio", "audio": "path/to/audio.wav"},
-            {"type": "text", "text": "Is this person currently speaking?"}
+            {"type": "text", "text": "These are 10 sequential frames... For each frame, determine whether this person is actively speaking..."}
         ]
     },
     {
         "role": "assistant",
-        "content": [{"type": "text", "text": "SPEAKING"}]  # ← the answer we want the model to learn
+        "content": [{"type": "text", "text": "Frame 1: SPEAKING\nFrame 2: SPEAKING\nFrame 3: NOT_SPEAKING\n...\nOverall: SPEAKING (6/10 frames)"}]
     }
 ]
 ```
+
+**Why per-frame output?** An earlier version used a single-token answer ("SPEAKING"), but the model took shortcuts — it got near-zero training loss without actually looking at the images/audio, then performed at random chance on evaluation. By requiring per-frame labels (~30+ tokens), the model must analyze each frame individually to get every label right.
 
 **Why a conversation format?** Qwen2.5-Omni is a chat model. It was trained to follow conversation patterns. By formatting our task as "user asks question, assistant answers," we leverage what the model already knows about following instructions.
 
@@ -164,17 +166,19 @@ labels[:-label_len - 1] = -100
 This is crucial. The `labels` tensor tells the model **which tokens to learn to predict**.
 
 - `-100` means "ignore this token, don't compute loss on it"
-- Only the last few tokens (the answer "SPEAKING" or "NOT_SPEAKING") have real labels
+- Only the assistant's response tokens have real labels (the per-frame analysis)
 
-**Why?** We don't want the model to learn to generate the system prompt or user question. We only want it to learn: given this input, the correct answer is "SPEAKING."
+**Why?** We don't want the model to learn to generate the system prompt or user question. We only grade it on the answer — the per-frame labels and overall summary. The model still processes the images and audio (it needs them to decide), but loss is only computed on the answer tokens.
 
 **Visual example:**
 
 ```
-input_ids:  [system_tokens... user_tokens... image_tokens... audio_tokens... "SPEAKING" EOS]
-labels:     [-100 -100 -100   -100 -100       -100            -100           "SPEAKING" EOS]
-                                                                              ↑ only these count
+input_ids:  [system... images... audio... question... "Frame 1: SPEAKING\nFrame 2: NOT_SPEAKING\n..." EOS]
+labels:     [-100      -100      -100     -100        "Frame 1: SPEAKING\nFrame 2: NOT_SPEAKING\n..." EOS]
+                                                       ↑ loss computed on all these answer tokens (~30+)
 ```
+
+With per-frame output, the model is graded on ~30+ tokens per sample instead of just 1-2, giving much stronger training signal.
 
 ### Step 4c: Pad to same length
 
@@ -477,9 +481,10 @@ Also saves the full training log (loss at every logging step, total time, etc.) 
 ## Complete Data Flow Summary
 
 ```
-metadata.jsonl
+metadata.jsonl (entity_id, image paths, audio path, per-frame labels)
     ↓  ASDDataset.__getitem__()
-conversation (system + user + assistant messages)
+conversation: "Here are 10 frames + audio. For each frame, is this person speaking?"
+    answer: "Frame 1: SPEAKING\nFrame 2: NOT_SPEAKING\n...\nOverall: SPEAKING"
     ↓  collate_fn()
     ↓  processor.apply_chat_template() → text with special tokens
     ↓  process_mm_info() → extracts raw images and audio
@@ -488,12 +493,12 @@ input_ids + attention_mask + labels (tensors of numbers)
     ↓  move to GPU
     ↓  model.thinker() forward pass
     ↓  embeddings → transformer layers (with LoRA) → predictions
-loss (single number: how wrong was the prediction?)
+loss (computed over ~30+ answer tokens — per-frame labels + overall)
     ↓  loss.backward()
 gradients (how to adjust each LoRA parameter)
     ↓  optimizer.step()
-updated LoRA weights (slightly better at ASD now)
-    ↓  repeat 2000 samples × 3 epochs
+updated LoRA weights (slightly better at per-frame ASD now)
+    ↓  repeat ~2000 samples × 3 epochs
     ↓  save_pretrained()
 adapter_model.safetensors (the trained LoRA weights, ~10-50MB)
 ```

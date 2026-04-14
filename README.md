@@ -77,15 +77,15 @@ asd-data/
 
 ### How Data Becomes a Training Sample
 
-The training script reads each metadata line and builds a multimodal conversation for Qwen2.5-Omni:
+The training script reads each metadata line and builds a multimodal conversation for Qwen2.5-Omni. The model must analyze **each frame individually** and output per-frame labels:
 
 | Role | Content |
 |------|---------|
-| **System** | "You are an active speaker detection system..." |
-| **User** | [face_frame1.jpg] [face_frame2.jpg] ... [audio.wav] + "Is this person speaking?" |
-| **Assistant** | "SPEAKING" or "NOT_SPEAKING" |
+| **System** | "You are an active speaker detection system. Analyze each frame..." |
+| **User** | [frame1.jpg] [frame2.jpg] ... [frame10.jpg] [audio.wav] + "For each frame, determine if this person is speaking" |
+| **Assistant** | "Frame 1: SPEAKING\nFrame 2: SPEAKING\nFrame 3: NOT_SPEAKING\n...\nOverall: SPEAKING (6/10 frames)" |
 
-The model learns to look at lip movements in the face crops, listen to the audio, and determine if this specific person is the one talking.
+This per-frame approach forces the model to actually analyze lip movements and audio at each timestamp, rather than taking shortcuts with a single-token answer.
 
 ## LoRA Configuration
 
@@ -278,9 +278,16 @@ The training script includes a **50-step timing test** at startup that estimates
 
 ## Evaluation Metrics
 
-- Accuracy, Precision, Recall, F1 Score
-- Confusion matrix
-- Comparison against baseline (model without fine-tuning)
+**Per-frame metrics (primary):**
+- Frame Accuracy, Precision, Recall, F1 Score
+- Frame mAP (mean Average Precision)
+- Frame Confusion Matrix
+
+**Track-level metrics:**
+- Track mAP — AP per entity track, averaged (standard ASD metric)
+- Track Accuracy, F1
+
+**Baseline comparison:** evaluates the model both with and without LoRA adapter to measure improvement over the base model.
 
 ## References
 

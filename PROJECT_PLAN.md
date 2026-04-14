@@ -16,7 +16,7 @@
 - 3 billion parameters (smallest available multimodal Qwen)
 - Uses TMRoPE (Time-aligned Multimodal RoPE) to synchronize audio and video timestamps
 - Open source, LoRA-compatible
-- Fits on a V100 (32GB) with LoRA fine-tuning
+- Fits on A100 (40GB) or V100 (32GB) with LoRA fine-tuning
 
 **Fallback:** Quantized `Qwen2.5-Omni-7B-GPTQ-Int4` if 3B quality is insufficient.
 
@@ -58,7 +58,8 @@ root/
 - **Dropout:** 0.05
 - **Target modules:** q_proj, k_proj, v_proj, o_proj
 - Only trains ~0.1% of total parameters
-- Training time: ~2-4 hours on 1x V100
+- Training time: ~30 min - 2 hours on 1x A100
+- **Per-frame output:** model outputs labels for each of the 10 frames, not a single label per track
 
 ---
 
@@ -173,7 +174,8 @@ python train.py
 
 ## Verification
 
-- Training loss should decrease across epochs
-- Evaluate accuracy, precision, recall, F1 on validation subset
-- Compare against random baseline (50%)
+- Training loss should decrease across epochs (expect meaningful loss >0.1, not near-zero)
+- Per-frame metrics: accuracy, precision, recall, F1, mAP on validation subset
+- Track-level mAP (standard ASD metric): AP per entity track, averaged
+- Compare against random baseline (50%) and base model without LoRA adapter
 - Generate confusion matrix
