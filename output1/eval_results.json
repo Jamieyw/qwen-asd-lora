@@ -1,0 +1,24 @@
+{
+  "accuracy": 0.466,
+  "precision": 0.46169354838709675,
+  "recall": 1.0,
+  "f1_score": 0.6317241379310344,
+  "mAP": 0.46169354838709675,
+  "confusion_matrix": [
+    [
+      4,
+      267
+    ],
+    [
+      0,
+      229
+    ]
+  ],
+  "total_samples": 500,
+  "valid_samples": 500,
+  "unknown_count": 0,
+  "inference_time_seconds": 228.11801195144653,
+  "per_sample_time": 0.4562360239028931,
+  "adapter_path": "./output/best_model",
+  "is_baseline": false
+}

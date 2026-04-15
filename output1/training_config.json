@@ -1,0 +1,23 @@
+{
+  "model_name": "Qwen/Qwen2.5-Omni-3B",
+  "data_dir": "./asd-data",
+  "output_dir": "./output",
+  "epochs": 3,
+  "batch_size": 1,
+  "gradient_accumulation_steps": 8,
+  "learning_rate": 0.0005,
+  "warmup_steps": 100,
+  "weight_decay": 0.01,
+  "max_grad_norm": 1.0,
+  "lora_r": 8,
+  "lora_alpha": 16,
+  "lora_dropout": 0.05,
+  "seed": 42,
+  "logging_steps": 10,
+  "save_steps": 500,
+  "timing_test_steps": 50,
+  "gradient_checkpointing": true,
+  "fp16": false,
+  "total_training_samples": 1991,
+  "total_optimizer_steps": 746
+}
