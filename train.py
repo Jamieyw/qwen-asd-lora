@@ -118,10 +118,16 @@ class ASDDataset(Dataset):
             "audio": entry["audio_path"],
         })
 
-        # Simple, direct question
+        # Prompt that hints the audio may not belong to this person
+        # This counteracts the model's bias of "hear audio + see face = SPEAKING"
         user_content.append({
             "type": "text",
-            "text": "Is this person currently speaking? Answer with only SPEAKING or NOT_SPEAKING.",
+            "text": (
+                "These are 10 frames of a person's face with audio from the scene. "
+                "The audio may or may not belong to this person — someone else in the "
+                "scene could be the one speaking. Is this person speaking? "
+                "Answer with only SPEAKING or NOT_SPEAKING."
+            ),
         })
 
         conversation = [
@@ -149,28 +155,30 @@ class ASDDataset(Dataset):
         }
 
 
-def collate_fn(batch, processor):
+def collate_fn(batch, processor, speaking_token_id, not_token_id):
     """
-    Collate function that processes conversations into model inputs.
+    Collate function for classification-based training.
 
-    Since multimodal inputs have variable sizes, we process one at a time
-    and let the processor handle padding.
+    Instead of including the answer in the input (teacher forcing),
+    we use add_generation_prompt=True so the model sees only the question.
+    The loss is computed on the logit at the last position, comparing
+    the probability of SPEAKING vs NOT_SPEAKING token IDs.
     """
     from qwen_omni_utils import process_mm_info
 
     all_input_ids = []
     all_attention_masks = []
-    all_labels_tensors = []
-    all_is_not_speaking = []
+    all_class_labels = []  # 1 = SPEAKING, 0 = NOT_SPEAKING
 
     for sample in batch:
-        conversation = sample["conversation"]
-        all_is_not_speaking.append(sample["is_not_speaking"])
+        # Build conversation WITHOUT the assistant answer
+        conversation = sample["conversation"][:-1]  # remove assistant message
 
-        # Apply chat template to get the full text
+        # Apply chat template WITH generation prompt
+        # This adds <|im_start|>assistant\n at the end
         text = processor.apply_chat_template(
             conversation,
-            add_generation_prompt=False,
+            add_generation_prompt=True,
             tokenize=False,
         )
 
@@ -190,52 +198,31 @@ def collate_fn(batch, processor):
         input_ids = inputs["input_ids"].squeeze(0)
         attention_mask = inputs["attention_mask"].squeeze(0)
 
-        # Create labels: mask everything except the assistant's response
-        # Labels = -100 for tokens we don't want to compute loss on
-        labels = input_ids.clone()
-
-        # Find where the assistant response starts
-        # The assistant response is the label text (SPEAKING/NOT_SPEAKING)
-        # We mask everything before it
-        label_text = sample["label"]
-        label_tokens = processor.tokenizer.encode(label_text, add_special_tokens=False)
-        label_len = len(label_tokens)
-
-        # Mask all tokens except the last label_len tokens (+ EOS)
-        # This makes the model only learn to predict the answer
-        if label_len < len(labels):
-            labels[:-label_len - 1] = -100  # -1 for EOS token
-
         all_input_ids.append(input_ids)
         all_attention_masks.append(attention_mask)
-        all_labels_tensors.append(labels)
+
+        # Binary class label: 1 = SPEAKING, 0 = NOT_SPEAKING
+        all_class_labels.append(1 if sample["majority_label"] == "SPEAKING" else 0)
 
     # Pad sequences to same length
     max_len = max(ids.size(0) for ids in all_input_ids)
+    pad_token_id = processor.tokenizer.pad_token_id or 0
 
     padded_input_ids = []
     padded_attention_masks = []
-    padded_labels = []
 
-    pad_token_id = processor.tokenizer.pad_token_id or 0
-
-    for input_ids, attn_mask, labels in zip(
-        all_input_ids, all_attention_masks, all_labels_tensors
-    ):
+    for input_ids, attn_mask in zip(all_input_ids, all_attention_masks):
         pad_len = max_len - input_ids.size(0)
         if pad_len > 0:
             input_ids = torch.cat([input_ids, torch.full((pad_len,), pad_token_id)])
             attn_mask = torch.cat([attn_mask, torch.zeros(pad_len, dtype=attn_mask.dtype)])
-            labels = torch.cat([labels, torch.full((pad_len,), -100)])
         padded_input_ids.append(input_ids)
         padded_attention_masks.append(attn_mask)
-        padded_labels.append(labels)
 
     return {
         "input_ids": torch.stack(padded_input_ids),
         "attention_mask": torch.stack(padded_attention_masks),
-        "labels": torch.stack(padded_labels),
-        "is_not_speaking": torch.tensor(all_is_not_speaking, dtype=torch.long),
+        "class_labels": torch.tensor(all_class_labels, dtype=torch.long),
     }
 
 
@@ -243,7 +230,7 @@ def collate_fn(batch, processor):
 # Training
 # ---------------------------------------------------------------------------
 
-def run_timing_test(model, dataloader, device, num_steps, collate_fn_with_proc):
+def run_timing_test(model, dataloader, device, num_steps, speaking_token_id, not_token_id, dtype):
     """Run a few steps and estimate total training time."""
     print(f"\n{'='*60}")
     print(f"Running timing test ({num_steps} steps)...")
@@ -258,13 +245,16 @@ def run_timing_test(model, dataloader, device, num_steps, collate_fn_with_proc):
 
         batch = {k: v.to(device) for k, v in batch.items()}
 
-        with torch.amp.autocast("cuda", dtype=torch.float16):
+        with torch.amp.autocast("cuda", dtype=dtype):
             outputs = model.thinker(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
-                labels=batch["labels"],
             )
-            loss = outputs.loss
+            logits = outputs.logits
+            seq_lens = batch["attention_mask"].sum(dim=1) - 1
+            last_logits = logits[torch.arange(logits.size(0)), seq_lens]
+            class_logits = torch.stack([last_logits[:, not_token_id], last_logits[:, speaking_token_id]], dim=1)
+            loss = torch.nn.functional.cross_entropy(class_logits, batch["class_labels"])
 
         loss.backward()
         model.zero_grad()
@@ -348,9 +338,14 @@ def train(args):
     print("\nLoading dataset...")
     train_dataset = ASDDataset(args.data_dir, split="train")
 
-    # Create collate function with processor bound
+    # Get token IDs for SPEAKING and NOT_SPEAKING (first token of each)
+    speaking_token_id = processor.tokenizer.encode("SPEAKING", add_special_tokens=False)[0]
+    not_token_id = processor.tokenizer.encode("NOT", add_special_tokens=False)[0]
+    print(f"Token IDs — SPEAKING: {speaking_token_id}, NOT: {not_token_id}")
+
+    # Create collate function with processor and token IDs bound
     def collate_fn_bound(batch):
-        return collate_fn(batch, processor)
+        return collate_fn(batch, processor, speaking_token_id, not_token_id)
 
     train_dataloader = DataLoader(
         train_dataset,
@@ -367,7 +362,7 @@ def train(args):
     if args.timing_test_steps > 0:
         per_step = run_timing_test(
             model, train_dataloader, device,
-            args.timing_test_steps, collate_fn_bound,
+            args.timing_test_steps, speaking_token_id, not_token_id, dtype,
         )
 
         total_steps = len(train_dataloader) * args.epochs
@@ -449,24 +444,32 @@ def train(args):
             # Move batch to device
             batch = {k: v.to(device) for k, v in batch.items()}
 
-            # Forward pass through thinker (text generation component)
-            # Use custom weighted loss to counteract SPEAKING bias
+            # Forward pass — classification via logit comparison
+            # Instead of standard causal LM loss (which is near-zero and useless),
+            # we compute binary cross-entropy on the logits for SPEAKING vs NOT_SPEAKING
+            # token IDs at the answer position. This gives real gradient signal.
             with torch.amp.autocast("cuda", dtype=dtype):
                 outputs = model.thinker(
                     input_ids=batch["input_ids"],
                     attention_mask=batch["attention_mask"],
-                    labels=batch["labels"],
                 )
 
-                # Weight the loss: NOT_SPEAKING samples get higher weight
-                # to counteract the model's strong bias toward SPEAKING
-                # (base model predicts SPEAKING ~90% of the time)
-                if "is_not_speaking" in batch:
-                    # 5x weight for NOT_SPEAKING, 1x for SPEAKING
-                    weight = batch["is_not_speaking"].float() * 4.0 + 1.0
-                    loss = (outputs.loss * weight.mean()) / args.gradient_accumulation_steps
-                else:
-                    loss = outputs.loss / args.gradient_accumulation_steps
+                # Get logits at the last position (where model predicts the answer)
+                logits = outputs.logits  # (batch, seq_len, vocab_size)
+                # Find last non-padding position for each sample
+                seq_lens = batch["attention_mask"].sum(dim=1) - 1  # last real token index
+                last_logits = logits[torch.arange(logits.size(0)), seq_lens]  # (batch, vocab_size)
+
+                # Extract logits for SPEAKING and NOT_SPEAKING first tokens
+                speaking_logit = last_logits[:, speaking_token_id]
+                not_speaking_logit = last_logits[:, not_token_id]
+
+                # Binary classification: stack into (batch, 2) and use cross entropy
+                class_logits = torch.stack([not_speaking_logit, speaking_logit], dim=1)
+                class_labels = batch["class_labels"]  # 0=NOT_SPEAKING, 1=SPEAKING
+
+                loss = torch.nn.functional.cross_entropy(class_logits, class_labels)
+                loss = loss / args.gradient_accumulation_steps
 
             # Backward pass
             loss.backward()
