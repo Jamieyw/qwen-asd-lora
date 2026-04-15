@@ -67,7 +67,7 @@ python train.py \
     --model_name "Qwen/Qwen2.5-Omni-3B" \
     --data_dir ./asd-data \
     --output_dir ./output \
-    --epochs 5 \
+    --epochs 3 \
     --batch_size 1 \
     --gradient_accumulation_steps 8 \
     --learning_rate 5e-4 \
