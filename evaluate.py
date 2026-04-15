@@ -102,8 +102,14 @@ def build_conversation(sample):
     """
     user_content = []
 
-    # Limit to 3 images (matches training)
-    for img_path in sample["image_paths"][:3]:
+    # Limit to 3 evenly spaced images (matches training)
+    all_imgs = sample["image_paths"]
+    if len(all_imgs) > 3:
+        indices = [0, len(all_imgs) // 2, len(all_imgs) - 1]
+        selected_imgs = [all_imgs[i] for i in indices]
+    else:
+        selected_imgs = all_imgs
+    for img_path in selected_imgs:
         user_content.append({"type": "image", "image": img_path})
 
     user_content.append({"type": "audio", "audio": sample["audio_path"]})
