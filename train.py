@@ -100,67 +100,34 @@ class ASDDataset(Dataset):
     def __getitem__(self, idx):
         entry = self.metadata[idx]
 
-        # Build conversation in Qwen2.5-Omni format
-        # Use VIDEO input (not separate images) to enable TMRoPE temporal alignment
+        # Build conversation — simple prompt that works (see experiment_logs/prompt_investigation.md)
+        # Key finding: verbose per-frame prompts cause the model to default to NOT_SPEAKING.
+        # Simple, direct prompts let the model use its existing multimodal understanding.
         user_content = []
 
-        # Add video (frames + audio combined into MP4)
-        video_path = entry.get("video_path")
-        if video_path and Path(video_path).exists():
+        # Add face crop images
+        for img_path in entry["image_paths"]:
             user_content.append({
-                "type": "video",
-                "video": video_path,
-            })
-        else:
-            # Fallback: use separate images + audio if video wasn't created
-            for i, img_path in enumerate(entry["image_paths"]):
-                user_content.append({
-                    "type": "image",
-                    "image": img_path,
-                })
-            user_content.append({
-                "type": "audio",
-                "audio": entry["audio_path"],
+                "type": "image",
+                "image": img_path,
             })
 
-        # Add the question — ask for per-frame analysis
-        num_frames = entry["num_frames"]
+        # Add audio
         user_content.append({
-            "type": "text",
-            "text": (
-                f"This video shows {num_frames} sequential frames of a person's face "
-                f"with corresponding audio. "
-                f"For each frame, determine whether this person is actively speaking "
-                f"at that moment by analyzing their lip movements and the audio. "
-                f"Output one line per frame in the format: Frame N: SPEAKING or NOT_SPEAKING"
-            ),
+            "type": "audio",
+            "audio": entry["audio_path"],
         })
 
-        # Build per-frame answer string
-        # e.g. "Frame 1: SPEAKING\nFrame 2: NOT_SPEAKING\n..."
-        labels = entry["labels"]
-        answer_lines = []
-        for i, label in enumerate(labels):
-            status = "SPEAKING" if label == 1 else "NOT_SPEAKING"
-            answer_lines.append(f"Frame {i+1}: {status}")
-        answer_text = "\n".join(answer_lines)
-
-        # Also add overall summary
-        speaking_count = sum(labels)
-        total = len(labels)
-        overall = "SPEAKING" if speaking_count > total / 2 else "NOT_SPEAKING"
-        answer_text += f"\nOverall: {overall} ({speaking_count}/{total} frames)"
+        # Simple, direct question
+        user_content.append({
+            "type": "text",
+            "text": "Is this person currently speaking? Answer with only SPEAKING or NOT_SPEAKING.",
+        })
 
         conversation = [
             {
                 "role": "system",
-                "content": [{"type": "text", "text": (
-                    "You are an active speaker detection system. "
-                    "Given sequential face images and audio from a video, "
-                    "analyze each frame to determine whether the person is "
-                    "speaking at that moment. Look at lip movements across frames "
-                    "and match them with the audio signal."
-                )}],
+                "content": [{"type": "text", "text": "You are an active speaker detection system."}],
             },
             {
                 "role": "user",
@@ -168,14 +135,14 @@ class ASDDataset(Dataset):
             },
             {
                 "role": "assistant",
-                "content": [{"type": "text", "text": answer_text}],
+                "content": [{"type": "text", "text": entry["majority_label"]}],
             },
         ]
 
         return {
             "conversation": conversation,
-            "label": answer_text,
-            "labels": labels,
+            "label": entry["majority_label"],
+            "labels": entry["labels"],
             "majority_label": entry["majority_label"],
             "entity_id": entry["entity_id"],
         }
@@ -204,9 +171,8 @@ def collate_fn(batch, processor):
             tokenize=False,
         )
 
-        # Process multimodal info — use_audio_in_video=True enables TMRoPE
-        # temporal alignment between audio and video frames
-        audios, images, videos = process_mm_info(conversation, use_audio_in_video=True)
+        # Process multimodal info (images + audio)
+        audios, images, videos = process_mm_info(conversation, use_audio_in_video=False)
 
         # Tokenize and process
         inputs = processor(
@@ -216,7 +182,6 @@ def collate_fn(batch, processor):
             videos=videos,
             return_tensors="pt",
             padding=True,
-            use_audio_in_video=True,
         )
 
         input_ids = inputs["input_ids"].squeeze(0)

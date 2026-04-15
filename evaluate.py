@@ -95,41 +95,26 @@ def load_val_data(data_dir):
 
 
 def build_conversation(sample):
-    """Build inference conversation (without assistant response)."""
+    """Build inference conversation (without assistant response).
+
+    Uses simple prompt format — see experiment_logs/prompt_investigation.md
+    for why verbose per-frame prompts cause NOT_SPEAKING collapse.
+    """
     user_content = []
 
-    # Use video input if available (enables TMRoPE temporal alignment)
-    video_path = sample.get("video_path")
-    if video_path and Path(video_path).exists():
-        user_content.append({"type": "video", "video": video_path})
-    else:
-        # Fallback to separate images + audio
-        for img_path in sample["image_paths"]:
-            user_content.append({"type": "image", "image": img_path})
-        user_content.append({"type": "audio", "audio": sample["audio_path"]})
+    for img_path in sample["image_paths"]:
+        user_content.append({"type": "image", "image": img_path})
 
-    num_frames = sample["num_frames"]
+    user_content.append({"type": "audio", "audio": sample["audio_path"]})
     user_content.append({
         "type": "text",
-        "text": (
-            f"This video shows {num_frames} sequential frames of a person's face "
-            f"with corresponding audio. "
-            f"For each frame, determine whether this person is actively speaking "
-            f"at that moment by analyzing their lip movements and the audio. "
-            f"Output one line per frame in the format: Frame N: SPEAKING or NOT_SPEAKING"
-        ),
+        "text": "Is this person currently speaking? Answer with only SPEAKING or NOT_SPEAKING.",
     })
 
     conversation = [
         {
             "role": "system",
-            "content": [{"type": "text", "text": (
-                "You are an active speaker detection system. "
-                "Given sequential face images and audio from a video, "
-                "analyze each frame to determine whether the person is "
-                "speaking at that moment. Look at lip movements across frames "
-                "and match them with the audio signal."
-            )}],
+            "content": [{"type": "text", "text": "You are an active speaker detection system."}],
         },
         {
             "role": "user",
@@ -140,47 +125,14 @@ def build_conversation(sample):
     return conversation
 
 
-def extract_per_frame_predictions(generated_text, num_frames):
-    """
-    Extract per-frame SPEAKING/NOT_SPEAKING labels from generated text.
-
-    Expected format:
-    Frame 1: SPEAKING
-    Frame 2: NOT_SPEAKING
-    ...
-    Overall: SPEAKING (6/10 frames)
-    """
-    predictions = []
+def extract_prediction(generated_text):
+    """Extract SPEAKING/NOT_SPEAKING from generated text."""
     text = generated_text.strip().upper()
 
-    for i in range(1, num_frames + 1):
-        # Look for "Frame N: SPEAKING" or "Frame N: NOT_SPEAKING"
-        if f"FRAME {i}: NOT_SPEAKING" in text or f"FRAME {i}: NOT SPEAKING" in text:
-            predictions.append(0)
-        elif f"FRAME {i}: SPEAKING" in text:
-            predictions.append(1)
-        else:
-            predictions.append(-1)  # couldn't parse
-
-    return predictions
-
-
-def extract_overall_prediction(generated_text):
-    """Extract overall SPEAKING/NOT_SPEAKING from the Overall line or majority vote."""
-    text = generated_text.strip().upper()
-
-    # Try to find "Overall: SPEAKING" or "Overall: NOT_SPEAKING"
-    if "OVERALL: NOT_SPEAKING" in text or "OVERALL: NOT SPEAKING" in text:
+    if "NOT_SPEAKING" in text or "NOT SPEAKING" in text:
         return "NOT_SPEAKING"
-    elif "OVERALL: SPEAKING" in text:
+    elif "SPEAKING" in text:
         return "SPEAKING"
-
-    # Fallback: count per-frame predictions
-    speaking = text.count("SPEAKING") - text.count("NOT_SPEAKING")
-    if speaking > 0:
-        return "SPEAKING"
-    elif speaking < 0:
-        return "NOT_SPEAKING"
     else:
         return "UNKNOWN"
 
@@ -200,11 +152,8 @@ def evaluate(args):
     # Run inference
     from qwen_omni_utils import process_mm_info
 
-    predictions = []       # track-level overall predictions
-    ground_truths = []     # track-level overall ground truths
-    all_frame_preds = []   # per-frame predictions (across all samples)
-    all_frame_gts = []     # per-frame ground truths
-    per_track_results = [] # list of (track_preds, track_gts) for mAP
+    predictions = []
+    ground_truths = []
     raw_outputs = []
 
     print(f"\nRunning inference on {len(samples)} samples...")
@@ -221,7 +170,7 @@ def evaluate(args):
                 tokenize=False,
             )
             audios, images, videos = process_mm_info(
-                conversation, use_audio_in_video=True
+                conversation, use_audio_in_video=False
             )
             inputs = processor(
                 text=text,
@@ -230,21 +179,16 @@ def evaluate(args):
                 videos=videos,
                 return_tensors="pt",
                 padding=True,
-                use_audio_in_video=True,
             )
             inputs = {k: v.to(device) for k, v in inputs.items()}
 
-            # Generate — need more tokens now for per-frame output
-            num_frames = sample["num_frames"]
-            max_tokens = num_frames * 15 + 30  # ~15 tokens per "Frame N: SPEAKING\n" + overall
-
+            # Generate
             with torch.no_grad():
                 with torch.amp.autocast("cuda", dtype=dtype):
                     output_ids = model.generate(
                         **inputs,
                         return_audio=False,
-                        use_audio_in_video=True,
-                        max_new_tokens=max_tokens,
+                        max_new_tokens=20,
                         do_sample=False,
                     )
 
@@ -259,36 +203,15 @@ def evaluate(args):
                 generated_ids, skip_special_tokens=True
             )[0]
 
-            # Extract per-frame predictions
-            frame_preds = extract_per_frame_predictions(generated_text, num_frames)
-            overall_pred = extract_overall_prediction(generated_text)
-
-            # Per-frame ground truth
-            frame_gts = sample["labels"]
-
-            # Collect per-frame results
-            track_fp = []
-            track_fg = []
-            for fp, fg in zip(frame_preds, frame_gts):
-                if fp != -1:  # only count parseable predictions
-                    all_frame_preds.append(fp)
-                    all_frame_gts.append(fg)
-                    track_fp.append(fp)
-                    track_fg.append(fg)
-            if track_fp:
-                per_track_results.append((track_fp, track_fg))
-
-            # Track overall (track-level) predictions
-            predictions.append(overall_pred)
+            prediction = extract_prediction(generated_text)
+            predictions.append(prediction)
             ground_truths.append(sample["majority_label"])
             raw_outputs.append({
                 "entity_id": sample["entity_id"],
                 "generated_text": generated_text,
-                "frame_predictions": frame_preds,
-                "frame_ground_truth": frame_gts,
-                "overall_prediction": overall_pred,
-                "overall_ground_truth": sample["majority_label"],
-                "overall_correct": overall_pred == sample["majority_label"],
+                "prediction": prediction,
+                "ground_truth": sample["majority_label"],
+                "correct": prediction == sample["majority_label"],
             })
 
         except Exception as e:
@@ -298,9 +221,9 @@ def evaluate(args):
             raw_outputs.append({
                 "entity_id": sample["entity_id"],
                 "error": str(e),
-                "overall_prediction": "UNKNOWN",
-                "overall_ground_truth": sample["majority_label"],
-                "overall_correct": False,
+                "prediction": "UNKNOWN",
+                "ground_truth": sample["majority_label"],
+                "correct": False,
             })
 
     total_time = time.time() - start_time
@@ -311,109 +234,75 @@ def evaluate(args):
     print(f"\n{'='*60}")
     print("EVALUATION RESULTS")
     print(f"{'='*60}")
-    print(f"Total track samples: {len(predictions)}")
+    print(f"Total samples: {len(predictions)}")
     print(f"Inference time: {total_time:.1f}s ({total_time/len(predictions):.2f}s/sample)")
 
     results = {}
 
-    # --- Per-frame metrics (primary metric for ASD) ---
-    print(f"\n--- Per-Frame Metrics (Primary) ---")
-    print(f"Total frame predictions: {len(all_frame_preds)}")
-
-    if all_frame_preds:
-        frame_acc = accuracy_score(all_frame_gts, all_frame_preds)
-        frame_prec = precision_score(all_frame_gts, all_frame_preds, zero_division=0)
-        frame_rec = recall_score(all_frame_gts, all_frame_preds, zero_division=0)
-        frame_f1 = f1_score(all_frame_gts, all_frame_preds, zero_division=0)
-        frame_cm = confusion_matrix(all_frame_gts, all_frame_preds)
-
-        print(f"Frame Accuracy: {frame_acc:.4f} ({frame_acc*100:.1f}%)")
-        print(f"Frame Precision: {frame_prec:.4f}")
-        print(f"Frame Recall: {frame_rec:.4f}")
-        print(f"Frame F1 Score: {frame_f1:.4f}")
-
-        if frame_cm.shape == (2, 2):
-            print(f"\nFrame Confusion Matrix:")
-            print(f"                  Predicted")
-            print(f"                  NOT_SPEAK  SPEAKING")
-            print(f"  Actual NOT_SPEAK  {frame_cm[0][0]:>6}    {frame_cm[0][1]:>6}")
-            print(f"  Actual SPEAKING   {frame_cm[1][0]:>6}    {frame_cm[1][1]:>6}")
-
-        print(f"\nFrame Classification Report:")
-        print(classification_report(
-            all_frame_gts, all_frame_preds,
-            target_names=["NOT_SPEAKING", "SPEAKING"],
-            digits=4,
-        ))
-
-        # Frame-level mAP (AP across all frames globally)
-        try:
-            frame_mAP = average_precision_score(all_frame_gts, all_frame_preds)
-            print(f"Frame mAP: {frame_mAP:.4f}")
-        except ValueError:
-            frame_mAP = None
-            print(f"Frame mAP: N/A (need both classes in ground truth)")
-
-        # Track-level mAP (AP per track, then average — standard ASD metric)
-        per_track_aps = []
-        for t_preds, t_gts in per_track_results:
-            if len(set(t_gts)) > 1:  # need both classes to compute AP
-                ap = average_precision_score(t_gts, t_preds)
-                per_track_aps.append(ap)
-        if per_track_aps:
-            track_mAP = np.mean(per_track_aps)
-            print(f"Track mAP: {track_mAP:.4f} (computed over {len(per_track_aps)}/{len(per_track_results)} tracks)")
-        else:
-            track_mAP = None
-            print(f"Track mAP: N/A (no tracks had both speaking and not-speaking frames)")
-
-        print(f"\nNote: mAP is computed with binary predictions (0/1), not confidence")
-        print(f"scores, since we use a generative model. This is a lower bound on")
-        print(f"what mAP would be with continuous probability scores.")
-
-        results["frame_accuracy"] = frame_acc
-        results["frame_precision"] = frame_prec
-        results["frame_recall"] = frame_rec
-        results["frame_f1"] = frame_f1
-        results["frame_mAP"] = frame_mAP
-        results["track_mAP"] = track_mAP
-        results["track_mAP_num_tracks"] = len(per_track_aps)
-        results["frame_confusion_matrix"] = frame_cm.tolist()
-        results["total_frames_evaluated"] = len(all_frame_preds)
-
-    # --- Track-level metrics (overall per entity) ---
-    print(f"\n--- Track-Level Metrics (Overall) ---")
-
+    # Filter out UNKNOWN predictions
     valid_mask = [p != "UNKNOWN" for p in predictions]
     valid_preds = [p for p, v in zip(predictions, valid_mask) if v]
     valid_gts = [g for g, v in zip(ground_truths, valid_mask) if v]
     unknown_count = len(predictions) - len(valid_preds)
 
     if unknown_count > 0:
-        print(f"WARNING: {unknown_count} samples had UNKNOWN overall predictions")
+        print(f"\nWARNING: {unknown_count} samples had UNKNOWN predictions")
 
     if valid_preds:
         label_map = {"SPEAKING": 1, "NOT_SPEAKING": 0}
         y_pred = [label_map.get(p, 0) for p in valid_preds]
         y_true = [label_map.get(g, 0) for g in valid_gts]
 
-        track_acc = accuracy_score(y_true, y_pred)
-        track_f1 = f1_score(y_true, y_pred, zero_division=0)
+        accuracy = accuracy_score(y_true, y_pred)
+        precision = precision_score(y_true, y_pred, zero_division=0)
+        recall = recall_score(y_true, y_pred, zero_division=0)
+        f1 = f1_score(y_true, y_pred, zero_division=0)
+        cm = confusion_matrix(y_true, y_pred)
 
-        print(f"Track Accuracy: {track_acc:.4f} ({track_acc*100:.1f}%)")
-        print(f"Track F1 Score: {track_f1:.4f}")
+        # mAP
+        try:
+            mAP = average_precision_score(y_true, y_pred)
+        except ValueError:
+            mAP = None
 
-        results["track_accuracy"] = track_acc
-        results["track_f1"] = track_f1
+        print(f"\nAccuracy: {accuracy:.4f} ({accuracy*100:.1f}%)")
+        print(f"Precision: {precision:.4f}")
+        print(f"Recall: {recall:.4f}")
+        print(f"F1 Score: {f1:.4f}")
+        if mAP is not None:
+            print(f"mAP: {mAP:.4f}")
 
-    # Random baseline comparison
-    print(f"\nRandom baseline: 50.0%")
-    if all_frame_preds:
-        print(f"Frame improvement over random: {(frame_acc - 0.5) * 100:+.1f}%")
+        if cm.shape == (2, 2):
+            print(f"\nConfusion Matrix:")
+            print(f"                  Predicted")
+            print(f"                  NOT_SPEAK  SPEAKING")
+            print(f"  Actual NOT_SPEAK  {cm[0][0]:>6}    {cm[0][1]:>6}")
+            print(f"  Actual SPEAKING   {cm[1][0]:>6}    {cm[1][1]:>6}")
+
+        print(f"\nClassification Report:")
+        print(classification_report(
+            y_true, y_pred,
+            target_names=["NOT_SPEAKING", "SPEAKING"],
+            digits=4,
+        ))
+
+        print(f"Random baseline: 50.0%")
+        print(f"Improvement over random: {(accuracy - 0.5) * 100:+.1f}%")
+
+        results["accuracy"] = accuracy
+        results["precision"] = precision
+        results["recall"] = recall
+        results["f1_score"] = f1
+        results["mAP"] = mAP
+        results["confusion_matrix"] = cm.tolist()
+    else:
+        print("\nNo valid predictions — all UNKNOWN")
 
     results["total_samples"] = len(predictions)
+    results["valid_samples"] = len(valid_preds)
     results["unknown_count"] = unknown_count
     results["inference_time_seconds"] = total_time
+    results["per_sample_time"] = total_time / max(len(predictions), 1)
     results["adapter_path"] = args.adapter_path
     results["is_baseline"] = args.no_adapter
 
