@@ -222,6 +222,51 @@ def find_entity_images_in_zip(zf, entity_id):
     return sorted(matches)
 
 
+def _create_video_from_frames(image_paths, audio_path, output_path, fps=5):
+    """
+    Combine face crop images + audio into an MP4 video.
+
+    This is critical for Qwen2.5-Omni: sending a video (not separate images)
+    enables TMRoPE temporal alignment, which synchronizes audio with video
+    frames so the model can detect lip-audio sync.
+
+    Args:
+        image_paths: list of JPG file paths (the frames)
+        audio_path: path to WAV audio file
+        output_path: path to write the MP4 video
+        fps: frames per second (5 fps for 10 frames = 2 second video)
+    """
+    import subprocess
+    import tempfile
+
+    # Create a temporary file listing the frames for ffmpeg
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+        for img_path in image_paths:
+            # Each frame shown for 1/fps seconds
+            f.write(f"file '{img_path}'\n")
+            f.write(f"duration {1.0/fps}\n")
+        # Repeat last frame (ffmpeg concat demuxer quirk)
+        f.write(f"file '{image_paths[-1]}'\n")
+        list_file = f.name
+
+    try:
+        # Combine frames into video with audio using ffmpeg
+        cmd = [
+            "ffmpeg", "-y",  # overwrite output
+            "-f", "concat", "-safe", "0", "-i", list_file,  # frames
+            "-i", audio_path,  # audio
+            "-c:v", "libx264", "-pix_fmt", "yuv420p",  # video codec
+            "-c:a", "aac",  # audio codec
+            "-shortest",  # stop when shortest stream ends
+            "-movflags", "+faststart",  # web-friendly
+            "-loglevel", "error",  # suppress verbose output
+            output_path,
+        ]
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+    finally:
+        os.unlink(list_file)  # clean up temp file
+
+
 def process_video_tracks(video_id, entity_ids, df, split, max_frames,
                          output_dir, cache_dir=None):
     """
@@ -234,6 +279,7 @@ def process_video_tracks(video_id, entity_ids, df, split, max_frames,
     split_dir = Path(output_dir) / split
     img_dir = split_dir / "images"
     audio_dir = split_dir / "audio"
+    video_dir = split_dir / "videos"
 
     # Download ZIPs
     audio_zip_path = download_zip(video_id, split, "clips_audios", cache_dir)
@@ -311,6 +357,15 @@ def process_video_tracks(video_id, entity_ids, df, split, max_frames,
                     dst.write(src.read())
                 image_paths.append(str(img_dst))
 
+            # Create MP4 video from frames + audio
+            # This enables TMRoPE temporal alignment in Qwen2.5-Omni
+            video_path = video_dir / f"{safe_id}.mp4"
+            try:
+                _create_video_from_frames(image_paths, str(audio_dst), str(video_path))
+            except Exception as e:
+                print(f"  Warning: Could not create video for {entity_id}: {e}")
+                video_path = None
+
             frame_labels_str = ", ".join(
                 [f"frame {i+1}: {'SPEAKING' if l == 1 else 'NOT_SPEAKING'}"
                  for i, l in enumerate(selected_labels)]
@@ -318,6 +373,7 @@ def process_video_tracks(video_id, entity_ids, df, split, max_frames,
 
             entry = {
                 "entity_id": entity_id,
+                "video_path": str(video_path) if video_path else None,
                 "image_paths": image_paths,
                 "audio_path": str(audio_dst),
                 "timestamps": selected_timestamps,
@@ -338,8 +394,10 @@ def process_split(df, sampled_ids, needed_videos, split, max_frames,
     split_dir = Path(output_dir) / split
     img_dir = split_dir / "images"
     audio_dir = split_dir / "audio"
+    video_dir = split_dir / "videos"
     img_dir.mkdir(parents=True, exist_ok=True)
     audio_dir.mkdir(parents=True, exist_ok=True)
+    video_dir.mkdir(parents=True, exist_ok=True)
 
     # Group sampled entity_ids by video
     sampled_set = set(sampled_ids)

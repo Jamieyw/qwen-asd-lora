@@ -98,17 +98,22 @@ def build_conversation(sample):
     """Build inference conversation (without assistant response)."""
     user_content = []
 
-    for img_path in sample["image_paths"]:
-        user_content.append({"type": "image", "image": img_path})
-
-    user_content.append({"type": "audio", "audio": sample["audio_path"]})
+    # Use video input if available (enables TMRoPE temporal alignment)
+    video_path = sample.get("video_path")
+    if video_path and Path(video_path).exists():
+        user_content.append({"type": "video", "video": video_path})
+    else:
+        # Fallback to separate images + audio
+        for img_path in sample["image_paths"]:
+            user_content.append({"type": "image", "image": img_path})
+        user_content.append({"type": "audio", "audio": sample["audio_path"]})
 
     num_frames = sample["num_frames"]
     user_content.append({
         "type": "text",
         "text": (
-            f"These are {num_frames} sequential frames of a person's face "
-            f"extracted from a video, along with the corresponding audio. "
+            f"This video shows {num_frames} sequential frames of a person's face "
+            f"with corresponding audio. "
             f"For each frame, determine whether this person is actively speaking "
             f"at that moment by analyzing their lip movements and the audio. "
             f"Output one line per frame in the format: Frame N: SPEAKING or NOT_SPEAKING"
@@ -216,7 +221,7 @@ def evaluate(args):
                 tokenize=False,
             )
             audios, images, videos = process_mm_info(
-                conversation, use_audio_in_video=False
+                conversation, use_audio_in_video=True
             )
             inputs = processor(
                 text=text,
@@ -225,6 +230,7 @@ def evaluate(args):
                 videos=videos,
                 return_tensors="pt",
                 padding=True,
+                use_audio_in_video=True,
             )
             inputs = {k: v.to(device) for k, v in inputs.items()}
 
@@ -237,6 +243,7 @@ def evaluate(args):
                     output_ids = model.generate(
                         **inputs,
                         return_audio=False,
+                        use_audio_in_video=True,
                         max_new_tokens=max_tokens,
                         do_sample=False,
                     )

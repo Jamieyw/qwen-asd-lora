@@ -101,28 +101,35 @@ class ASDDataset(Dataset):
         entry = self.metadata[idx]
 
         # Build conversation in Qwen2.5-Omni format
+        # Use VIDEO input (not separate images) to enable TMRoPE temporal alignment
         user_content = []
 
-        # Add face crop images (already saved as JPG)
-        for i, img_path in enumerate(entry["image_paths"]):
+        # Add video (frames + audio combined into MP4)
+        video_path = entry.get("video_path")
+        if video_path and Path(video_path).exists():
             user_content.append({
-                "type": "image",
-                "image": img_path,
+                "type": "video",
+                "video": video_path,
             })
-
-        # Add audio
-        user_content.append({
-            "type": "audio",
-            "audio": entry["audio_path"],
-        })
+        else:
+            # Fallback: use separate images + audio if video wasn't created
+            for i, img_path in enumerate(entry["image_paths"]):
+                user_content.append({
+                    "type": "image",
+                    "image": img_path,
+                })
+            user_content.append({
+                "type": "audio",
+                "audio": entry["audio_path"],
+            })
 
         # Add the question — ask for per-frame analysis
         num_frames = entry["num_frames"]
         user_content.append({
             "type": "text",
             "text": (
-                f"These are {num_frames} sequential frames of a person's face "
-                f"extracted from a video, along with the corresponding audio. "
+                f"This video shows {num_frames} sequential frames of a person's face "
+                f"with corresponding audio. "
                 f"For each frame, determine whether this person is actively speaking "
                 f"at that moment by analyzing their lip movements and the audio. "
                 f"Output one line per frame in the format: Frame N: SPEAKING or NOT_SPEAKING"
@@ -197,8 +204,9 @@ def collate_fn(batch, processor):
             tokenize=False,
         )
 
-        # Process multimodal info (images, audio)
-        audios, images, videos = process_mm_info(conversation, use_audio_in_video=False)
+        # Process multimodal info — use_audio_in_video=True enables TMRoPE
+        # temporal alignment between audio and video frames
+        audios, images, videos = process_mm_info(conversation, use_audio_in_video=True)
 
         # Tokenize and process
         inputs = processor(
@@ -208,6 +216,7 @@ def collate_fn(batch, processor):
             videos=videos,
             return_tensors="pt",
             padding=True,
+            use_audio_in_video=True,
         )
 
         input_ids = inputs["input_ids"].squeeze(0)
