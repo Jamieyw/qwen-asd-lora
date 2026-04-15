@@ -102,7 +102,8 @@ def build_conversation(sample):
     """
     user_content = []
 
-    for img_path in sample["image_paths"]:
+    # Limit to 3 images (matches training)
+    for img_path in sample["image_paths"][:3]:
         user_content.append({"type": "image", "image": img_path})
 
     user_content.append({"type": "audio", "audio": sample["audio_path"]})

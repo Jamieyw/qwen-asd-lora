@@ -105,8 +105,10 @@ class ASDDataset(Dataset):
         # Simple, direct prompts let the model use its existing multimodal understanding.
         user_content = []
 
-        # Add face crop images
-        for img_path in entry["image_paths"]:
+        # Add face crop images (limit to 3 — model works better with fewer images)
+        max_imgs = 3
+        image_paths = entry["image_paths"][:max_imgs]
+        for img_path in image_paths:
             user_content.append({
                 "type": "image",
                 "image": img_path,
@@ -142,6 +144,7 @@ class ASDDataset(Dataset):
         return {
             "conversation": conversation,
             "label": entry["majority_label"],
+            "is_not_speaking": 1 if entry["majority_label"] == "NOT_SPEAKING" else 0,
             "labels": entry["labels"],
             "majority_label": entry["majority_label"],
             "entity_id": entry["entity_id"],
@@ -160,9 +163,11 @@ def collate_fn(batch, processor):
     all_input_ids = []
     all_attention_masks = []
     all_labels_tensors = []
+    all_is_not_speaking = []
 
     for sample in batch:
         conversation = sample["conversation"]
+        all_is_not_speaking.append(sample["is_not_speaking"])
 
         # Apply chat template to get the full text
         text = processor.apply_chat_template(
@@ -232,6 +237,7 @@ def collate_fn(batch, processor):
         "input_ids": torch.stack(padded_input_ids),
         "attention_mask": torch.stack(padded_attention_masks),
         "labels": torch.stack(padded_labels),
+        "is_not_speaking": torch.tensor(all_is_not_speaking, dtype=torch.long),
     }
 
 
@@ -446,13 +452,21 @@ def train(args):
             batch = {k: v.to(device) for k, v in batch.items()}
 
             # Forward pass through thinker (text generation component)
+            # Use custom weighted loss to counteract SPEAKING bias
             with torch.amp.autocast("cuda", dtype=dtype):
                 outputs = model.thinker(
                     input_ids=batch["input_ids"],
                     attention_mask=batch["attention_mask"],
                     labels=batch["labels"],
                 )
-                loss = outputs.loss / args.gradient_accumulation_steps
+
+                # Weight the loss: NOT_SPEAKING samples get 2x weight
+                # to counteract the model's natural bias toward SPEAKING
+                if hasattr(batch, "is_not_speaking") or "is_not_speaking" in batch:
+                    weight = batch["is_not_speaking"].float() * 1.0 + 1.0  # 2x for NOT_SPEAKING, 1x for SPEAKING
+                    loss = (outputs.loss * weight.mean()) / args.gradient_accumulation_steps
+                else:
+                    loss = outputs.loss / args.gradient_accumulation_steps
 
             # Backward pass
             loss.backward()
