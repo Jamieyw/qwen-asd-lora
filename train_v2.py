@@ -41,11 +41,11 @@ def parse_args():
     p.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-Omni-3B")
     p.add_argument("--data_dir", type=str, default="./data")
     p.add_argument("--output_dir", type=str, default="./output")
-    p.add_argument("--epochs", type=int, default=3)
+    p.add_argument("--epochs", type=int, default=5)
     p.add_argument("--batch_size", type=int, default=1,
                    help="Batch size per GPU (1 for multimodal, use grad accum for effective batch)")
     p.add_argument("--gradient_accumulation_steps", type=int, default=8)
-    p.add_argument("--learning_rate", type=float, default=5e-5)
+    p.add_argument("--learning_rate", type=float, default=1e-4)
     p.add_argument("--warmup_steps", type=int, default=50)
     p.add_argument("--weight_decay", type=float, default=0.01)
     p.add_argument("--max_grad_norm", type=float, default=1.0)
