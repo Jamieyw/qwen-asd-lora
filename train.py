@@ -105,15 +105,8 @@ class ASDDataset(Dataset):
         # Simple, direct prompts let the model use its existing multimodal understanding.
         user_content = []
 
-        # Add face crop images (limit to 3, evenly spaced — model works better with fewer)
-        all_imgs = entry["image_paths"]
-        if len(all_imgs) > 3:
-            # Pick beginning, middle, end frames
-            indices = [0, len(all_imgs) // 2, len(all_imgs) - 1]
-            image_paths = [all_imgs[i] for i in indices]
-        else:
-            image_paths = all_imgs
-        for img_path in image_paths:
+        # Add all face crop images (10 frames)
+        for img_path in entry["image_paths"]:
             user_content.append({
                 "type": "image",
                 "image": img_path,
