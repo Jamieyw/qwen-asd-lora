@@ -458,10 +458,12 @@ def train(args):
                     labels=batch["labels"],
                 )
 
-                # Weight the loss: NOT_SPEAKING samples get 2x weight
-                # to counteract the model's natural bias toward SPEAKING
-                if hasattr(batch, "is_not_speaking") or "is_not_speaking" in batch:
-                    weight = batch["is_not_speaking"].float() * 1.0 + 1.0  # 2x for NOT_SPEAKING, 1x for SPEAKING
+                # Weight the loss: NOT_SPEAKING samples get higher weight
+                # to counteract the model's strong bias toward SPEAKING
+                # (base model predicts SPEAKING ~90% of the time)
+                if "is_not_speaking" in batch:
+                    # 5x weight for NOT_SPEAKING, 1x for SPEAKING
+                    weight = batch["is_not_speaking"].float() * 4.0 + 1.0
                     loss = (outputs.loss * weight.mean()) / args.gradient_accumulation_steps
                 else:
                     loss = outputs.loss / args.gradient_accumulation_steps
