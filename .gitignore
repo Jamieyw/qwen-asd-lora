@@ -6,7 +6,6 @@ data/
 
 # Model outputs and checkpoints
 output/
-*.safetensors
 *.bin
 *.pt
 *.pth
@@ -39,3 +38,4 @@ Thumbs.db
 
 # HuggingFace cache
 .cache/
+.gstack/
