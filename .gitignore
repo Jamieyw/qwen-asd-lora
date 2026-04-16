@@ -6,6 +6,7 @@ data/
 
 # Model outputs and checkpoints
 output/
+*.safetensors
 *.bin
 *.pt
 *.pth
