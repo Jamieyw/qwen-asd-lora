@@ -81,8 +81,8 @@ The core insight: when you fine-tune a model for a specific task, you don't need
 
 Result:
 - Original model: 3,000,000,000 parameters (frozen, not trained)
-- LoRA adapters: ~3,000,000 parameters (trained) — only **0.1%** of the total
-- GPU memory: drops from ~48GB to ~6-8GB for trainable params
+- LoRA adapters: ~10,000,000 parameters (trained) — only **~0.3%** of the total
+- GPU memory: drops from ~48GB to ~20-27GB
 - Training speed: much faster
 - Storage: LoRA adapter saves are ~10-50MB instead of ~6GB
 
@@ -112,20 +112,22 @@ Where:
 - `W` = original weight matrix (4096 x 4096) — **frozen**
 - `A` = small matrix (r x 4096) — **trainable**
 - `B` = small matrix (4096 x r) — **trainable**
-- `r` = rank (we use 8)
+- `r` = rank (we use 16 for the thinker, 4 for the vision encoder)
 
 So instead of training a 4096x4096 matrix (16.7M params), we train:
-- A: 8 x 4096 = 32,768 params
-- B: 4096 x 8 = 32,768 params
-- Total: 65,536 params (250x fewer!)
+- A: 16 x 4096 = 65,536 params
+- B: 4096 x 16 = 65,536 params
+- Total: 131,072 params (128x fewer!)
 
 ### Why "Low Rank"?
 
-The matrix `B * A` has shape (4096, 4096) — same as `W` — but because it's the product of two thin matrices (through a bottleneck of size `r=8`), it can only represent changes in an 8-dimensional subspace. Research shows this is enough for task-specific adaptation.
+The matrix `B * A` has shape (4096, 4096) — same as `W` — but because it's the product of two thin matrices (through a bottleneck of size `r=16`), it can only represent changes in a 16-dimensional subspace. Research shows this is enough for task-specific adaptation.
 
 ### Which Layers Get LoRA?
 
-Not every layer in the model needs LoRA. We apply it to the **attention layers** — specifically:
+We apply LoRA to two components of the model:
+
+**Thinker (text LLM) — attention + feed-forward:**
 
 | Module | What It Does |
 |--------|-------------|
@@ -133,8 +135,19 @@ Not every layer in the model needs LoRA. We apply it to the **attention layers**
 | `k_proj` | **Key** projection — "what information do I have?" |
 | `v_proj` | **Value** projection — "what's the actual content?" |
 | `o_proj` | **Output** projection — combines attention results |
+| `gate_proj` | Feed-forward gate (SwiGLU activation) |
+| `up_proj` | Feed-forward up projection |
+| `down_proj` | Feed-forward down projection |
 
-These are part of the **self-attention mechanism**, which is how the model decides which parts of the input (which face, which audio segment) to focus on. This is crucial for ASD because the model needs to learn to attend to lip movements synchronized with audio.
+Including feed-forward layers gives the model more capacity to learn task-specific transformations beyond just attention patterns.
+
+**Vision encoder (last 8 of 32 layers) — attention only:**
+
+| Module | What It Does |
+|--------|-------------|
+| `q`, `k`, `v` | Attention projections in the visual transformer |
+
+The vision encoder needs to learn that **lip state** (open vs closed, movement across frames) is the key signal for ASD — not just whether a face is present. Applying LoRA to only the last 8 layers preserves early-layer visual features (edges, textures) while fine-tuning high-level representations.
 
 ---
 
@@ -145,48 +158,72 @@ These are part of the **self-attention mechanism**, which is how the model decid
 ```
 Qwen2.5-Omni-3B
 ├── Vision Encoder    — processes face crop images (JPG)
-│   └── Converts images to numerical representations (embeddings)
+│   └── 32 transformer layers; LoRA on last 8 (layers 24–31)
 ├── Audio Encoder     — processes audio segments (WAV)
-│   └── Converts audio waveforms to embeddings
+│   └── Converts audio waveforms to embeddings (frozen)
 ├── TMRoPE           — time-aligns visual and audio embeddings
 │   └── Ensures frame timestamps match audio timestamps
-├── Transformer Layers (x N)  — the main "brain"
-│   ├── Self-Attention (q_proj, k_proj, v_proj, o_proj) ← LoRA goes here
-│   └── Feed-Forward Network
+├── Thinker (LLM)    — the main "brain"
+│   ├── Self-Attention (q/k/v/o_proj) ← LoRA here (r=16)
+│   └── Feed-Forward (gate/up/down_proj) ← LoRA here (r=16)
 └── Output Head       — produces final prediction
 ```
 
-### LoRA Configuration
+### Thinker LoRA Configuration
 
 ```python
 LoraConfig(
-    r=8,                    # rank — size of the bottleneck (see section 5)
-    lora_alpha=16,          # scaling factor (explained below)
-    lora_dropout=0.05,      # randomly zeroes 5% of LoRA outputs during training
-    target_modules=[        # which weight matrices to adapt
-        "q_proj", "k_proj", "v_proj", "o_proj"
+    r=16,                   # rank — size of the bottleneck (doubled from v1)
+    lora_alpha=32,          # scaling factor (alpha/r = 2, same ratio as v1)
+    lora_dropout=0.1,       # randomly zeroes 10% of LoRA outputs during training
+    target_modules=[        # attention + feed-forward layers
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj",
     ],
-    task_type="CAUSAL_LM"   # type of task
+    task_type="CAUSAL_LM"
 )
 ```
+
+### Vision Encoder LoRA Configuration
+
+```python
+LoraConfig(
+    r=4,                    # small rank — preserve pretrained visual features
+    lora_alpha=8,
+    lora_dropout=0.05,
+    target_modules=[        # layer-specific attention modules (last 8 layers)
+        "blocks.24.attn.q", "blocks.24.attn.k", "blocks.24.attn.v",
+        # ... through blocks.31
+    ],
+)
+```
+
+### Label Smoothing
+
+Instead of hard labels (1 for SPEAKING, 0 for NOT_SPEAKING), we use **label smoothing = 0.1**:
+- SPEAKING → target probability = 0.9
+- NOT_SPEAKING → target probability = 0.1
+
+This prevents the model from driving its output logits to extreme values, acts as regularization, and improves calibration. It is especially useful for ASD because the boundary between speaking and not-speaking is sometimes genuinely ambiguous (e.g. trailing off, background noise).
 
 ### Data Flow (What Happens to One Training Sample)
 
 ```
 Input:
-  ├── Face crops: [img_t1.jpg, img_t2.jpg, ..., img_t25.jpg]  (25 frames = 1 second)
-  └── Audio: entity_audio.wav (corresponding 1-second audio clip)
-      
-      ↓ Vision Encoder converts each face to a 1024-dim vector
-      ↓ Audio Encoder converts audio to sequence of 1024-dim vectors
+  ├── Face crops: [img_t1.jpg, ..., img_t10.jpg]  (10 frames)
+  └── Audio: entity_audio.wav
+
+      ↓ Vision Encoder (last 8 layers have LoRA)
+      ↓   → visual embeddings (lip state, face features)
+      ↓ Audio Encoder (frozen)
+      ↓   → audio embeddings
       ↓ TMRoPE adds positional + temporal information
-      ↓ Transformer layers process everything together
-      ↓   (LoRA adapters modify attention behavior here)
-      ↓ Output head predicts: "SPEAKING" or "NOT_SPEAKING"
-      
-      ↓ Compare with true label
-      ↓ Compute loss
-      ↓ Update ONLY LoRA parameters (A and B matrices)
+      ↓ Thinker transformer layers (LoRA on attention + FFN)
+      ↓   → processes all modalities together
+      ↓ Logits at last position
+      ↓   → extract SPEAKING logit vs NOT_SPEAKING logit
+      ↓ Binary cross-entropy loss (with label_smoothing=0.1)
+      ↓ Update ONLY LoRA parameters (vision + thinker)
 ```
 
 ---
@@ -196,119 +233,100 @@ Input:
 ### Step 1: Load the Pre-trained Model
 
 ```python
-model = Qwen2_5OmniModel.from_pretrained("Qwen/Qwen2.5-Omni-3B")
+model = Qwen2_5OmniForConditionalGeneration.from_pretrained("Qwen/Qwen2.5-Omni-3B")
 ```
 
-This downloads ~6GB of weights and loads them into GPU memory. All 3B parameters are loaded but marked as **frozen** (no gradients computed).
+Downloads ~6GB of weights into GPU memory. All 3B parameters are frozen.
 
 ### Step 2: Attach LoRA Adapters
 
 ```python
-model = get_peft_model(model, lora_config)
+model.thinker = get_peft_model(model.thinker, lora_config)
+model.thinker.visual = get_peft_model(model.thinker.visual, vision_lora_config)
 ```
 
-This adds small A and B matrices alongside every q/k/v/o_proj layer. Only these new matrices are marked as **trainable**.
-
-The model now has two types of parameters:
-- Frozen: 3,000,000,000 (original, not updated)
-- Trainable: ~3,000,000 (LoRA, updated every step)
+Adds A and B matrices alongside targeted layers in both the thinker and vision encoder. Only these new matrices are trainable.
 
 ### Step 3: Prepare a Batch
 
-A **batch** is a small group of training samples processed together. We use batch_size=2 (limited by GPU memory since multimodal data is large).
-
 ```
 Batch = [
-    (images_1, audio_1, label_1),   # Sample 1: face crops + audio -> SPEAKING
-    (images_2, audio_2, label_2),   # Sample 2: face crops + audio -> NOT_SPEAKING
+    (images_1, audio_1, label_1),   # SPEAKING
+    (images_2, audio_2, label_2),   # NOT_SPEAKING
 ]
 ```
 
 ### Step 4: Forward Pass
 
 The model processes the batch:
-1. Images go through the vision encoder -> visual embeddings
-2. Audio goes through the audio encoder -> audio embeddings
-3. Both are concatenated and passed through transformer layers
-4. Each transformer layer applies self-attention:
-   - Original: `attention = softmax(Q * K^T) * V` (using frozen W_q, W_k, W_v)
-   - With LoRA: `attention = softmax((Q + delta_Q) * (K + delta_K)^T) * (V + delta_V)`
-   - Where `delta_Q = B_q * A_q * x` (the LoRA modification)
-5. The model outputs a probability distribution over tokens
-6. We extract the prediction: "SPEAKING" or "NOT_SPEAKING"
+1. Images go through the vision encoder (last 8 layers modified by LoRA)
+2. Audio goes through the audio encoder (frozen)
+3. Both pass through the thinker transformer layers (LoRA on attention + FFN)
+4. We extract the logit at the last sequence position for `SPEAKING` and `NOT_SPEAKING` tokens
+5. Binary cross-entropy loss is computed between these two logits and the ground truth label
 
-### Step 5: Compute Loss
-
-**Loss** = how wrong the model was. We use **cross-entropy loss**:
+### Step 5: Compute Loss (with Label Smoothing)
 
 ```
-loss = -log(probability the model assigned to the correct answer)
+loss = cross_entropy(class_logits, labels, label_smoothing=0.1)
 ```
 
-- If the correct answer is "SPEAKING" and the model said 90% chance -> loss = -log(0.9) = 0.105 (low, good)
-- If the correct answer is "SPEAKING" and the model said 10% chance -> loss = -log(0.1) = 2.303 (high, bad)
+Label smoothing modifies the target distribution:
+- Hard label: [0, 1] (NOT_SPEAKING=0, SPEAKING=1)
+- Smoothed label: [0.05, 0.95] (the smoothing mass is spread uniformly)
 
-### Step 6: Backward Pass (Backpropagation)
+### Step 6: Backward Pass
 
-The loss flows backward through the network. For each LoRA parameter, we compute its **gradient** — how much and in which direction to adjust it to reduce the loss.
+Loss flows back through the network. Gradients are computed only for LoRA parameters (vision encoder + thinker). The 3B frozen parameters are skipped entirely.
 
-Key: gradients are ONLY computed for LoRA parameters (the frozen original parameters are skipped), which saves massive amounts of computation.
+### Step 7: Separate Optimizer Step
 
-### Step 7: Optimizer Step
+Two parameter groups with different learning rates:
+- **Thinker LoRA:** lr = 5e-5
+- **Vision encoder LoRA:** lr = 5e-5 × 0.2 = 1e-5
 
-The **optimizer** (AdamW) uses the gradients to update LoRA parameters:
-
-```
-new_param = old_param - learning_rate * gradient
-```
-
-AdamW is smarter than this simple formula — it keeps running averages of gradients and their squares to make more informed updates. But the basic idea is: nudge each parameter in the direction that reduces loss.
+The vision encoder gets a lower LR because we want small adjustments to pretrained visual features, not a full overwrite.
 
 ### Step 8: Gradient Accumulation
 
-Because our batch size is only 2 (GPU memory limit), we use **gradient accumulation = 4**:
-
-- Process 4 batches of 2 samples each
-- Accumulate (add up) the gradients from all 4 batches
-- Only then do one optimizer update
-
-This effectively gives us a batch size of 2 x 4 = 8, which produces more stable training, without needing more GPU memory.
+With batch_size=1, we accumulate gradients over 8 steps before updating, giving an effective batch size of 8.
 
 ### Step 9: Repeat
 
-One **epoch** = processing every sample in the training set once. We train for 3 epochs, meaning each sample is seen 3 times. The model improves gradually:
-
-```
-Epoch 1: loss ~2.0 → ~0.8  (learning the basics)
-Epoch 2: loss ~0.8 → ~0.5  (refining)
-Epoch 3: loss ~0.5 → ~0.3  (fine-tuning details)
-```
-
-(Actual numbers will vary)
+8 epochs × ~2000 samples = ~16,000 forward passes. The model learns gradually; both precision and recall improve as it learns to detect lip movement patterns.
 
 ---
 
 ## 8. Key Hyperparameters Explained
 
-### LoRA Hyperparameters
+### LoRA Hyperparameters (Thinker)
 
 | Parameter | Value | What It Controls |
 |-----------|-------|-----------------|
-| `r` (rank) | 8 | Bottleneck size. Higher = more capacity but more memory. 4-16 is typical. |
-| `lora_alpha` | 16 | Scaling factor. The LoRA output is multiplied by `alpha/r = 16/8 = 2`. Controls how much influence the LoRA adapters have vs. the original weights. |
-| `lora_dropout` | 0.05 | During training, randomly zeros 5% of LoRA outputs. Prevents **overfitting** (memorizing training data instead of learning patterns). |
+| `r` (rank) | 16 | Bottleneck size. Higher = more capacity. Doubled from v1 to handle feed-forward targets. |
+| `lora_alpha` | 32 | Scaling factor. LoRA output multiplied by `alpha/r = 2`. Same ratio as v1. |
+| `lora_dropout` | 0.1 | Zeroes 10% of LoRA outputs during training. Increased from 0.05 to compensate for larger adapter. |
+
+### LoRA Hyperparameters (Vision Encoder)
+
+| Parameter | Value | What It Controls |
+|-----------|-------|-----------------|
+| `r` (rank) | 4 | Small rank to preserve pretrained visual features. |
+| `lora_alpha` | 8 | Scaling factor (alpha/r = 2). |
+| `lora_dropout` | 0.05 | Light regularization for visual adapter. |
 
 ### Training Hyperparameters
 
 | Parameter | Value | What It Controls |
 |-----------|-------|-----------------|
-| `learning_rate` | 2e-4 (0.0002) | How big each parameter update step is. Too high = unstable, too low = too slow. |
-| `batch_size` | 2 | Samples processed at once. Limited by GPU memory. |
-| `gradient_accumulation_steps` | 4 | How many batches to accumulate before updating. Effective batch = 2 x 4 = 8. |
-| `num_epochs` | 3 | How many times to iterate over the full training set. |
-| `warmup_steps` | 100 | For the first 100 steps, learning rate gradually increases from 0 to 2e-4. Prevents early instability. |
-| `weight_decay` | 0.01 | Slightly penalizes large parameter values. Regularization to prevent overfitting. |
-| `bf16` | True | Use bfloat16 precision (16-bit instead of 32-bit). Halves memory usage with minimal accuracy loss. V100 may use fp16 instead. |
+| `learning_rate` | 5e-5 | Thinker LR. Lowered from 1e-4 for more stable convergence. |
+| `vision_lr_scale` | 0.2 | Vision encoder LR = 5e-5 × 0.2 = 1e-5. Protects pretrained visual features. |
+| `label_smoothing` | 0.1 | Soft labels instead of hard 0/1. Reduces overconfidence. |
+| `batch_size` | 1 | Limited by GPU memory (multimodal data is large). |
+| `gradient_accumulation_steps` | 8 | Effective batch = 1 × 8 = 8. |
+| `epochs` | 8 | More epochs than v1 to accommodate the lower LR. |
+| `warmup_steps` | 100 | LR ramps from 0 to 5e-5 over 100 steps. |
+| `weight_decay` | 0.01 | Regularization. |
 
 ---
 
@@ -317,22 +335,19 @@ Epoch 3: loss ~0.5 → ~0.3  (fine-tuning details)
 ### Memory Breakdown (V100, 32GB)
 
 ```
-Model weights (frozen, bf16):     ~6 GB
-LoRA parameters:                  ~12 MB  (tiny!)
-Optimizer states (for LoRA only): ~24 MB
-Gradients (for LoRA only):        ~12 MB
-Activations (intermediate values): ~10-15 GB  (depends on sequence length)
-Input data (images + audio batch): ~2-4 GB
-CUDA overhead:                     ~2 GB
-─────────────────────────────────────────
-Total:                             ~20-27 GB  (fits in 32GB!)
+Model weights (frozen, bf16):          ~6 GB
+Thinker LoRA parameters:               ~25 MB
+Vision encoder LoRA parameters:        ~2 MB
+Optimizer states (LoRA only):          ~50 MB
+Gradients (LoRA only):                 ~25 MB
+Activations (intermediate values):     ~10-15 GB
+Input data (images + audio batch):     ~2-4 GB
+CUDA overhead:                         ~2 GB
+─────────────────────────────────────────────
+Total:                                 ~20-27 GB  (fits in 32GB)
 ```
 
-### Why Activations Are So Large
-
-During the forward pass, the model saves intermediate results at every layer (called "activations"). These are needed for the backward pass to compute gradients. With multimodal input (25 images + audio), these activations are substantial.
-
-If memory is tight, **gradient checkpointing** can be enabled: it discards activations during forward pass and recomputes them during backward pass. Trades computation time for memory.
+If memory is tight, enable `--gradient_checkpointing`: discards activations during the forward pass and recomputes during backward. Trades ~30% more compute for ~40% less memory.
 
 ---
 
@@ -340,32 +355,36 @@ If memory is tight, **gradient checkpointing** can be enabled: it discards activ
 
 ### What Gets Saved
 
-Only the LoRA adapter weights are saved (~10-50MB), not the full model. The saved files:
+Only the LoRA adapter weights are saved (~20-60MB total):
 
 ```
 output/
-├── adapter_model.safetensors    # LoRA A and B matrices
-├── adapter_config.json          # LoRA configuration
-└── training_args.json           # hyperparameters used
+├── best_model/
+│   ├── adapter_model.safetensors    # thinker LoRA A and B matrices
+│   ├── adapter_config.json          # LoRA configuration
+│   └── ...                          # processor/tokenizer files
+└── training_config.json             # all hyperparameters used
 ```
+
+The vision encoder LoRA is saved as part of the thinker's PEFT model since `model.thinker.visual` is wrapped inside `model.thinker`.
 
 ### How to Use the Fine-Tuned Model
 
 ```python
 # Load original model
-model = Qwen2_5OmniModel.from_pretrained("Qwen/Qwen2.5-Omni-3B")
-# Load LoRA adapter on top
-model = PeftModel.from_pretrained(model, "output/")
-# Now model has the original weights + your LoRA adjustments
+model = Qwen2_5OmniForConditionalGeneration.from_pretrained("Qwen/Qwen2.5-Omni-3B")
+# Load thinker LoRA adapter (includes vision encoder LoRA)
+model.thinker = PeftModel.from_pretrained(model.thinker, "output/best_model")
 ```
 
 ### Evaluation Metrics
 
-- **Accuracy:** % of correct predictions (SPEAKING vs NOT_SPEAKING)
-- **Precision:** Of all predicted "SPEAKING", how many were actually speaking?
-- **Recall:** Of all actually speaking, how many did we catch?
-- **F1 Score:** Harmonic mean of precision and recall (balances both)
-- **Confusion Matrix:** 2x2 grid showing true positives, false positives, etc.
+- **Accuracy:** % of correct predictions
+- **Precision:** Of all predicted SPEAKING, how many were actually speaking?
+- **Recall:** Of all actually speaking, how many were caught?
+- **F1 Score:** Harmonic mean of precision and recall
+- **mAP:** Area under the Precision-Recall curve
+- **Confusion Matrix:** 2×2 grid of TP, FP, TN, FN
 
 ---
 
@@ -373,12 +392,13 @@ model = PeftModel.from_pretrained(model, "output/")
 
 | Issue | Symptom | Solution |
 |-------|---------|----------|
-| Out of memory (OOM) | CUDA out of memory error | Reduce batch_size to 1, enable gradient checkpointing, reduce max image resolution |
-| Loss not decreasing | Loss stays flat or oscillates | Lower learning rate (try 5e-5), check data formatting, ensure labels are correct |
-| Loss goes to NaN | Loss becomes NaN or inf | Lower learning rate, check for data corruption, switch to fp32 |
-| Overfitting | Training loss drops but validation loss increases | Increase dropout, reduce epochs, add more training data |
-| Slow training | Each step takes very long | Reduce number of frames per sample, lower image resolution, check GPU utilization with `nvidia-smi` |
-| Model predicts same class | Always says SPEAKING or NOT_SPEAKING | Check label balance in dataset, adjust class weights in loss function |
+| Out of memory (OOM) | CUDA out of memory error | Enable `--gradient_checkpointing`, reduce `--unfreeze_vision_layers` |
+| Loss not decreasing | Loss stays flat | Lower LR, check that label smoothing isn't too high |
+| Loss goes to NaN | Loss becomes NaN or inf | Lower LR, switch to fp32, reduce `--max_grad_norm` |
+| Overfitting | Training loss drops but val loss rises | Increase dropout, reduce epochs |
+| Slow training | Each step takes very long | Reduce `--unfreeze_vision_layers`, check GPU utilization |
+| Model predicts same class | Always SPEAKING or NOT_SPEAKING | Check label balance, verify label smoothing is active |
+| Vision LoRA not loading | Module name mismatch | Check exact layer names: `for n, _ in model.thinker.visual.named_modules(): print(n)` |
 
 ---
 
@@ -391,11 +411,12 @@ model = PeftModel.from_pretrained(model, "output/")
 | **Embedding** | A numerical representation (vector) of input data that the model can work with |
 | **Epoch** | One complete pass through the entire training dataset |
 | **Gradient** | The direction and magnitude to adjust a parameter to reduce loss |
+| **Label smoothing** | Replacing hard 0/1 targets with soft values (e.g. 0.1/0.9) to prevent overconfidence |
 | **Loss** | A number measuring how wrong the model's prediction was |
 | **Optimizer** | Algorithm that uses gradients to update parameters (AdamW in our case) |
 | **Overfitting** | When the model memorizes training data instead of learning general patterns |
 | **Parameter** | A learnable number (weight) in the model |
 | **Self-attention** | Mechanism that lets the model decide which parts of the input to focus on |
 | **Tensor** | A multi-dimensional array of numbers (generalization of matrices) |
-| **Token** | A unit of text/input that the model processes (a word, subword, or special symbol) |
+| **Token** | A unit of text/input that the model processes |
 | **Transformer** | The neural network architecture used by Qwen and most modern LLMs |

@@ -1,91 +1,85 @@
-# train.py — Full Code Walkthrough
+# train_v2.py — Full Code Walkthrough
 
 A line-by-line explanation of every step in the training script.
+
+> This walkthrough covers `train_v2.py`, the current training script. It differs from the original `train.py` in three ways: LoRA is applied to the vision encoder's last 8 layers, label smoothing (0.1) is used on the classification loss, and LoRA hyperparameters have been updated (r=16, alpha=32, dropout=0.1, feed-forward targets added).
 
 ---
 
 ## Big Picture
 
-The script does 7 things in order:
+The script does 8 things in order:
 
 1. Parse command-line arguments
 2. Load the pre-trained Qwen2.5-Omni-3B model
-3. Attach LoRA adapters (the small trainable matrices)
-4. Load the prepared dataset
-5. Run a timing test to estimate total training time
-6. Run the training loop (the core learning process)
-7. Save the trained LoRA weights
+3. Attach LoRA adapters to the thinker (text LLM) — attention + feed-forward
+4. Attach LoRA adapters to the vision encoder's last N layers
+5. Load the prepared dataset
+6. Run a timing test to estimate total training time
+7. Run the training loop
+8. Save the trained LoRA weights
 
 ### The Workflow in Plain English
 
-**Step 1: Read the recipe card.** We start with `metadata.jsonl` — each line is like a recipe card that says: "Here are 10 photos of someone's face, here's the audio clip, and here are the per-frame labels (which frames are speaking, which aren't)."
+**Step 1: Read the recipe card.** We start with `metadata.jsonl` — each line describes one entity track: paths to 10 face images, the audio clip, and a majority label (SPEAKING or NOT_SPEAKING based on how many frames the person was speaking).
 
-**Step 2: Build a question for the model.** We format this into a conversation, like texting the model: "Here are 10 sequential face photos and an audio clip. For each frame, tell me if this person is speaking." And we include the correct per-frame answers so the model can learn from them.
+**Step 2: Build a question for the model.** We format this into a conversation: "Here are 10 face photos and an audio clip. Is this person speaking? Answer with only SPEAKING or NOT_SPEAKING." We do NOT include the answer in the input — instead, we let the model generate a prediction and read the logits directly.
 
-**Step 3: Translate everything into numbers.** The model can't see images or hear audio — it only understands numbers. Face photos become grids of numbers (like how a digital photo is really just RGB values). Audio becomes a sequence of numbers (like how a WAV file is amplitude values over time). Text becomes token IDs (each word = a number). All of these get **stitched into one single sequence** — images and audio interleaved together, not processed separately.
+**Step 3: Translate everything into numbers.** Face photos → grids of RGB numbers. Audio → amplitude values. Text → token IDs. All of these get stitched into one unified sequence and passed through the model.
 
-**Step 4: The model thinks (forward pass).** This combined sequence goes through the model's transformer layers. At each layer, the model uses **self-attention** — every element can "look at" every other element. The audio numbers attend to the face image numbers and vice versa. This is how the model figures out: "the lips are moving in sync with the audio" = SPEAKING, or "the lips are still but there's audio" = NOT_SPEAKING. It's all processed together as one unified stream, not audio-branch + video-branch combined at the end.
+**Step 4: The model thinks (forward pass).** The vision encoder (with LoRA on the last 8 layers) converts face images into embeddings. The audio encoder (frozen) converts audio. The thinker transformer layers process everything together using self-attention. LoRA modifies both the attention layers and feed-forward layers of the thinker.
 
-**Step 5: Grade the answer (loss).** The model predicts per-frame labels ("Frame 1: SPEAKING\nFrame 2: NOT_SPEAKING\n..."). We compare each predicted token to the correct answer. If the model was confident and right, the loss is low (good). If it was wrong, the loss is high (bad). With ~30+ tokens of output per sample, the model gets meaningful feedback on every frame.
+**Step 5: Read the logit (classification head).** Instead of generating tokens and computing language modeling loss, we extract the logit values at the last sequence position for two specific tokens: `SPEAKING` and `NOT_SPEAKING`. We stack these into a 2-class classification problem and apply cross-entropy loss with label smoothing.
 
-**Step 6: Figure out who's responsible (backward pass).** The loss flows backward through the model. For each of the ~3 million LoRA parameters, we calculate: "if I nudge this number up or down, does the loss go up or down?" These are the gradients — a direction for improvement.
+**Step 6: Figure out who's responsible (backward pass).** Gradients flow back through the network to both the thinker LoRA parameters and the vision encoder LoRA parameters. The frozen 3B original weights are skipped.
 
-**Step 7: Nudge the weights (optimizer step).** Each LoRA parameter gets nudged slightly in the direction that reduces the loss. Imagine 3 million tiny dials, and we turn each one a tiny bit. The model is now slightly better at detecting active speakers.
+**Step 7: Nudge the weights (optimizer step).** Two optimizer parameter groups: thinker LoRA at lr=5e-5, vision encoder LoRA at lr=1e-5. Lower LR on the vision encoder protects pretrained visual feature representations.
 
-**Step 8: Repeat.** Do this for every training sample (e.g. 2000) x 3 passes (epochs) = 6000 times total. Each time, the model gets a little better.
-
-**Step 9: Save.** Save those 3 million tuned dial positions to a file (~10-50MB). To use it later, load the original Qwen model + your adapter = a model that's good at active speaker detection.
+**Step 8: Repeat and save.** 8 epochs × ~2000 samples. Best model saved after each epoch that achieves lowest average loss.
 
 ---
 
-## 1. Imports (Lines 13–30)
+## 1. Imports (Lines 16–33)
 
 ```python
-import torch                    # PyTorch — the deep learning framework
-from peft import LoraConfig, get_peft_model, TaskType  # LoRA library
-from torch.utils.data import Dataset, DataLoader       # Data loading utilities
+import torch
+from peft import LoraConfig, get_peft_model, TaskType
+from torch.utils.data import Dataset, DataLoader
 from transformers import (
-    Qwen2_5OmniForConditionalGeneration,   # The model class
-    Qwen2_5OmniProcessor,                   # Handles tokenization + image/audio processing
-    get_linear_schedule_with_warmup,         # Learning rate scheduler
+    Qwen2_5OmniForConditionalGeneration,
+    Qwen2_5OmniProcessor,
+    get_linear_schedule_with_warmup,
 )
 ```
 
-**Why these?**
-- `torch` is what actually runs the math on the GPU
-- `peft` (Parameter-Efficient Fine-Tuning) provides LoRA
-- `transformers` is HuggingFace's library that has the Qwen model
-- `Dataset`/`DataLoader` handle feeding data to the model in batches
+- `torch` — runs math on the GPU
+- `peft` — LoRA library from HuggingFace
+- `transformers` — provides the Qwen model and processor
+- `Dataset`/`DataLoader` — handle feeding data in batches
 
 ---
 
-## 2. Arguments (Lines 37–62)
+## 2. Arguments (Lines 40–71)
 
-```python
-def parse_args():
-    p.add_argument("--batch_size", type=int, default=1)
-    p.add_argument("--gradient_accumulation_steps", type=int, default=8)
-    p.add_argument("--learning_rate", type=float, default=2e-4)
-    p.add_argument("--lora_r", type=int, default=8)
-    # ... etc
-```
-
-These let you tweak training from the command line without editing code. The key ones:
+Key arguments and their defaults:
 
 | Argument | Default | What it controls |
 |----------|---------|-----------------|
-| `--batch_size` | 1 | Samples processed at once (1 because multimodal data is huge) |
-| `--gradient_accumulation_steps` | 8 | Accumulate gradients over 8 mini-batches before updating weights. Effective batch = 1 x 8 = 8 |
-| `--learning_rate` | 2e-4 | How big each weight update step is. Too high = unstable, too low = too slow |
-| `--lora_r` | 8 | LoRA rank — the bottleneck size (see LORA_GUIDE.md) |
-| `--fp16` | off | Use 16-bit floats (needed for V100, not needed for A100) |
-| `--gradient_checkpointing` | off | Trade compute time for memory savings |
+| `--epochs` | 8 | Training passes through the full dataset |
+| `--learning_rate` | 5e-5 | Thinker LoRA learning rate |
+| `--lora_r` | 16 | LoRA rank for the thinker |
+| `--lora_alpha` | 32 | LoRA scaling (alpha/r = 2) |
+| `--lora_dropout` | 0.1 | LoRA dropout rate |
+| `--label_smoothing` | 0.1 | Soft label factor (0 = hard labels) |
+| `--unfreeze_vision_layers` | 8 | How many vision encoder layers get LoRA |
+| `--vision_lr_scale` | 0.2 | Vision encoder LR = learning_rate × this |
+| `--gradient_accumulation_steps` | 8 | Effective batch = 1 × 8 = 8 |
+| `--fp16` | off | Use fp16 (needed for V100, not A100) |
+| `--gradient_checkpointing` | off | Trade compute time for memory |
 
 ---
 
-## 3. ASDDataset Class (Lines 69–151)
-
-This is how the model sees each training sample.
+## 3. ASDDataset Class (Lines 78–158)
 
 ### `__init__` — Load metadata
 
@@ -97,358 +91,214 @@ def __init__(self, data_dir, split="train"):
             self.metadata.append(json.loads(line.strip()))
 ```
 
-Reads the `metadata.jsonl` file that `prepare_data.py` created. Each line has paths to images, audio, and the label.
+Reads the `metadata.jsonl` file produced by `prepare_data.py`. Each line is a dict with image paths, audio path, per-frame labels, and majority label.
 
 ### `__getitem__` — Build one training conversation
 
-```python
-def __getitem__(self, idx):
-    entry = self.metadata[idx]
-```
-
-When the DataLoader asks for sample #42, this function builds a **conversation** that Qwen2.5-Omni understands:
+Builds a conversation in Qwen2.5-Omni's format. The key design choice is a **simple, direct prompt** — earlier experiments showed that verbose per-frame prompts caused the model to default to NOT_SPEAKING by paying too little attention to the actual media.
 
 ```python
 conversation = [
     {
         "role": "system",
-        "content": [{"type": "text", "text": "You are an active speaker detection system. Analyze each frame..."}]
+        "content": [{"type": "text", "text": "You are an active speaker detection system."}],
     },
     {
         "role": "user",
         "content": [
             {"type": "image", "image": "path/to/face_frame000.jpg"},
-            {"type": "image", "image": "path/to/face_frame001.jpg"},
-            # ... up to 10 face images
+            # ... 10 images total
             {"type": "audio", "audio": "path/to/audio.wav"},
-            {"type": "text", "text": "These are 10 sequential frames... For each frame, determine whether this person is actively speaking..."}
-        ]
+            {"type": "text", "text": "These are 10 frames of a person's face with audio from the scene. The audio may or may not belong to this person — someone else in the scene could be the one speaking. Is this person speaking? Answer with only SPEAKING or NOT_SPEAKING."},
+        ],
     },
     {
         "role": "assistant",
-        "content": [{"type": "text", "text": "Frame 1: SPEAKING\nFrame 2: SPEAKING\nFrame 3: NOT_SPEAKING\n...\nOverall: SPEAKING (6/10 frames)"}]
-    }
+        "content": [{"type": "text", "text": "SPEAKING"}],  # majority label
+    },
 ]
 ```
 
-**Why per-frame output?** An earlier version used a single-token answer ("SPEAKING"), but the model took shortcuts — it got near-zero training loss without actually looking at the images/audio, then performed at random chance on evaluation. By requiring per-frame labels (~30+ tokens), the model must analyze each frame individually to get every label right.
-
-**Why a conversation format?** Qwen2.5-Omni is a chat model. It was trained to follow conversation patterns. By formatting our task as "user asks question, assistant answers," we leverage what the model already knows about following instructions.
+The assistant message is included in the returned dict but **removed** inside `collate_fn` before passing to the model. This is intentional — we use logit-based classification, not teacher-forced generation.
 
 ---
 
-## 4. Collate Function (Lines 154–238)
+## 4. Collate Function (Lines 161–221)
 
-This is the trickiest part. The DataLoader calls this to combine multiple samples into one batch.
+This is called by the DataLoader to combine samples into a batch.
 
-### Step 4a: Turn conversation into tokens
+### What it does
 
 ```python
-text = processor.apply_chat_template(conversation, add_generation_prompt=False, tokenize=False)
+# Remove the assistant answer — we classify via logits, not generation
+conversation = sample["conversation"][:-1]
+
+# Apply chat template WITH generation prompt
+text = processor.apply_chat_template(
+    conversation,
+    add_generation_prompt=True,  # adds <|im_start|>assistant\n at the end
+    tokenize=False,
+)
+
+# Process multimodal inputs
 audios, images, videos = process_mm_info(conversation, use_audio_in_video=False)
-inputs = processor(text=text, audio=audios, images=images, videos=videos, ...)
+inputs = processor(text=text, audio=audios, images=images, ...)
 ```
 
-What happens here:
-1. `apply_chat_template` converts the conversation into a text string with special tokens like `<|im_start|>system`, `<|im_start|>user`, etc.
-2. `process_mm_info` extracts the actual image/audio data from the file paths
-3. `processor()` tokenizes the text and converts images/audio into numerical tensors
+`add_generation_prompt=True` is critical: it puts the model in "about to answer" state, so the logit at the last position is the model's best prediction of what token comes first in the answer — exactly where we want to compare SPEAKING vs NOT_SPEAKING logits.
 
-The result is `input_ids` — a sequence of numbers where each number represents a token (word piece, image patch, or audio chunk).
-
-### Step 4b: Create labels with masking
-
-```python
-labels = input_ids.clone()
-labels[:-label_len - 1] = -100
-```
-
-This is crucial. The `labels` tensor tells the model **which tokens to learn to predict**.
-
-- `-100` means "ignore this token, don't compute loss on it"
-- Only the assistant's response tokens have real labels (the per-frame analysis)
-
-**Why?** We don't want the model to learn to generate the system prompt or user question. We only grade it on the answer — the per-frame labels and overall summary. The model still processes the images and audio (it needs them to decide), but loss is only computed on the answer tokens.
-
-**Visual example:**
-
-```
-input_ids:  [system... images... audio... question... "Frame 1: SPEAKING\nFrame 2: NOT_SPEAKING\n..." EOS]
-labels:     [-100      -100      -100     -100        "Frame 1: SPEAKING\nFrame 2: NOT_SPEAKING\n..." EOS]
-                                                       ↑ loss computed on all these answer tokens (~30+)
-```
-
-With per-frame output, the model is graded on ~30+ tokens per sample instead of just 1-2, giving much stronger training signal.
-
-### Step 4c: Pad to same length
-
-```python
-max_len = max(ids.size(0) for ids in all_input_ids)
-# ... pad shorter sequences with zeros
-```
-
-Different samples have different lengths (different number of images, different audio lengths). GPUs need all inputs in a batch to be the same length, so we pad shorter ones with zeros. The `attention_mask` tells the model which positions are real (1) vs padding (0).
+**No labels tensor** — unlike the original `train.py` which passed `labels` to the model for language modeling loss, `train_v2.py` only produces `input_ids`, `attention_mask`, and `class_labels` (integer 0 or 1). The loss is computed manually in the training loop.
 
 ---
 
-## 5. Load Model (Lines 282–312)
+## 5. Vision Encoder LoRA Setup (Lines 270–318)
 
 ```python
-dtype = torch.float16 if args.fp16 else torch.bfloat16
+def setup_vision_encoder_lora(model, args):
+    total_vision_layers = 32
+    start_layer = total_vision_layers - args.unfreeze_vision_layers  # default: 24
 
+    vision_target_modules = []
+    for i in range(start_layer, total_vision_layers):
+        vision_target_modules.extend([
+            f"blocks.{i}.attn.q",
+            f"blocks.{i}.attn.k",
+            f"blocks.{i}.attn.v",
+        ])
+
+    vision_lora_config = LoraConfig(r=4, lora_alpha=8, lora_dropout=0.05,
+                                    target_modules=vision_target_modules)
+    model.thinker.visual = get_peft_model(model.thinker.visual, vision_lora_config)
+```
+
+**Why the vision encoder?** The model's main failure mode was: *it hears audio + sees a face → defaults to SPEAKING*. The audio encoder already provides audio information. What the model needs to learn is to use the face images more selectively — looking at whether lips are moving rather than just whether a face is present. Fine-tuning the last 8 vision layers (where high-level semantic features form) teaches this.
+
+**Why only the last 8 layers?** Early vision encoder layers detect low-level features (edges, textures) that should stay pretrained. The last layers produce high-level semantic representations where "lip movement vs. static face" is encoded. Touching only those avoids disrupting general visual understanding.
+
+**Why different attention names?** The vision encoder uses short names (`q`, `k`, `v`) instead of the thinker's `q_proj`, `k_proj`, `v_proj`. If this causes issues, check with:
+```python
+for n, _ in model.thinker.visual.named_modules():
+    if any(x in n for x in ['.q', '.k', '.v']): print(n)
+```
+
+---
+
+## 6. Optimizer Setup (Lines 321–357)
+
+```python
+def build_optimizer(model, args):
+    thinker_params = []
+    vision_params = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if "visual" in name:
+            vision_params.append(param)
+        else:
+            thinker_params.append(param)
+
+    param_groups = [
+        {"params": thinker_params, "lr": args.learning_rate},         # 5e-5
+        {"params": vision_params,  "lr": args.learning_rate * 0.2},   # 1e-5
+    ]
+    optimizer = torch.optim.AdamW(param_groups, weight_decay=0.01)
+```
+
+**Why two parameter groups?** We want the thinker to adapt significantly to the ASD classification task. We want the vision encoder to make only small adjustments — enough to become sensitive to lip movement, but not so much that it forgets what faces look like. A 5× lower LR achieves this balance.
+
+---
+
+## 7. Load Model and Apply LoRA (Lines 374–419)
+
+```python
+# Load base model
 model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
-    args.model_name,
-    torch_dtype=dtype,
-    device_map="auto",
+    args.model_name, torch_dtype=dtype, device_map="auto"
 )
-processor = Qwen2_5OmniProcessor.from_pretrained(args.model_name)
-```
 
-- `from_pretrained` downloads the 3B parameter model from HuggingFace (or uses cache)
-- `torch_dtype=dtype` loads weights in 16-bit precision (halves memory vs 32-bit)
-- `device_map="auto"` automatically places the model on the GPU
-- The processor handles converting text/images/audio into the format the model expects
-
----
-
-## 6. Apply LoRA (Lines 314–335)
-
-```python
+# Apply thinker LoRA (attention + feed-forward)
 lora_config = LoraConfig(
-    r=8,                     # rank — bottleneck size of A and B matrices
-    lora_alpha=16,           # scaling factor (output multiplied by alpha/r = 2)
-    lora_dropout=0.05,       # randomly zero 5% of LoRA outputs during training
-    target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],  # which layers
-    bias="none",             # don't train bias terms
-    task_type=TaskType.CAUSAL_LM,   # we're doing text generation
+    r=16, lora_alpha=32, lora_dropout=0.1,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                    "gate_proj", "up_proj", "down_proj"],
+    task_type=TaskType.CAUSAL_LM,
 )
-
 model.thinker = get_peft_model(model.thinker, lora_config)
+
+# Apply vision encoder LoRA (last 8 layers, q/k/v only)
+setup_vision_encoder_lora(model, args)
 ```
 
-**Why `model.thinker`?** Qwen2.5-Omni has two components:
-- **Thinker** — processes inputs and generates text (this is what we fine-tune)
-- **Talker** — generates speech audio output (we don't need this for ASD)
+**Why include feed-forward layers in the thinker?** The feed-forward layers (`gate_proj`, `up_proj`, `down_proj`) are responsible for transforming representations after attention. For classification tasks, they often encode the "meaning" that gets mapped to the output. Including them doubles the adapter's capacity at modest memory cost.
 
-`get_peft_model` inserts small LoRA matrices (A and B) alongside every q/k/v/o_proj layer in the thinker. All original weights are frozen.
-
-```python
-model.thinker.print_trainable_parameters()
-# Output: "trainable params: 3,145,728 || all params: 3,000,000,000 || trainable%: 0.1049%"
-```
-
-### Gradient checkpointing
-
-```python
-if args.gradient_checkpointing:
-    model.thinker.enable_input_require_grads()
-    model.thinker.gradient_checkpointing_enable()
-```
-
-Normally, the forward pass saves all intermediate values (activations) for the backward pass. With gradient checkpointing, it discards them and recomputes during backward. Trades ~30% more compute time for ~40% less GPU memory.
+**Why `model.thinker`?** Qwen2.5-Omni has two parts: the **Thinker** (processes input and generates text) and the **Talker** (generates speech). We don't need speech output for ASD, so only the thinker is fine-tuned.
 
 ---
 
-## 7. DataLoader (Lines 337–354)
+## 8. Training Loop (Lines 521–613)
 
-```python
-train_dataloader = DataLoader(
-    train_dataset,
-    batch_size=args.batch_size,   # 1 sample per batch
-    shuffle=True,                  # randomize order each epoch
-    collate_fn=collate_fn_bound,   # our custom function from step 4
-    num_workers=2,                 # 2 CPU threads load data while GPU trains
-    pin_memory=True,               # pre-load data into GPU-friendly memory
-)
-```
-
-The DataLoader is a conveyor belt:
-1. Picks random indices from the dataset
-2. Calls `__getitem__` for each
-3. Calls `collate_fn` to batch them together
-4. Delivers the batch to the training loop
-
----
-
-## 8. Timing Test (Lines 356–378)
-
-```python
-if args.timing_test_steps > 0:
-    per_step = run_timing_test(model, train_dataloader, device, 50, ...)
-
-    estimated_time = per_step * total_steps
-    if estimated_time > 4 * 3600:
-        print("WARNING: exceeds 4 hour limit!")
-```
-
-Runs 50 training steps, measures how long each takes, then extrapolates. If the estimate exceeds 4 hours, it warns you so you can cancel (`scancel`) and reduce data instead of wasting a full 4-hour GPU slot.
-
----
-
-## 9. Optimizer and Scheduler (Lines 380–396)
-
-```python
-optimizer = torch.optim.AdamW(
-    [p for p in model.parameters() if p.requires_grad],  # ONLY LoRA params
-    lr=args.learning_rate,     # 0.0002
-    weight_decay=args.weight_decay,  # 0.01
-)
-```
-
-**AdamW** is the optimizer — the algorithm that actually updates LoRA weights. It's smarter than basic gradient descent:
-- Keeps a running average of gradients (momentum)
-- Keeps a running average of squared gradients (adaptive learning rate per parameter)
-- Weight decay penalizes large parameter values (regularization)
-
-`if p.requires_grad` filters to only LoRA parameters (the frozen 3B original params have `requires_grad=False`).
-
-```python
-scheduler = get_linear_schedule_with_warmup(
-    optimizer,
-    num_warmup_steps=100,          # gradually increase LR from 0 to 0.0002 over 100 steps
-    num_training_steps=optimizer_steps,  # then linearly decay to 0
-)
-```
-
-**Learning rate schedule:**
-
-```
-LR
-0.0002 |       /‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾\
-       |      /                      \
-       |     /                        \
-       |    /                          \
-0      |___/                            \___
-       0  100                         total steps
-       ↑ warmup                      ↑ decay
-```
-
-Warmup prevents early instability (random initial gradients are large, high LR would overshoot). Linear decay helps fine-tune in the final steps.
-
----
-
-## 10. Training Loop (Lines 398–516)
-
-This is the core learning process. Let's trace one complete iteration:
-
-### 10a: Start epoch
-
-```python
-for epoch in range(args.epochs):  # 3 epochs = 3 passes through all data
-```
-
-### 10b: Get a batch
-
-```python
-for step, batch in enumerate(progress_bar):
-    batch = {k: v.to(device) for k, v in batch.items()}
-```
-
-Move the batch (input_ids, attention_mask, labels) from CPU to GPU.
-
-### 10c: Forward pass
+### Forward pass + logit classification
 
 ```python
 with torch.amp.autocast("cuda", dtype=dtype):
     outputs = model.thinker(
         input_ids=batch["input_ids"],
         attention_mask=batch["attention_mask"],
-        labels=batch["labels"],
     )
-    loss = outputs.loss / args.gradient_accumulation_steps
+
+    logits = outputs.logits  # (batch, seq_len, vocab_size)
+
+    # Get logit at the last real token (where model predicts first answer token)
+    seq_lens = batch["attention_mask"].sum(dim=1) - 1
+    last_logits = logits[torch.arange(logits.size(0)), seq_lens]  # (batch, vocab_size)
+
+    # Extract the two class logits
+    speaking_logit = last_logits[:, speaking_token_id]
+    not_speaking_logit = last_logits[:, not_token_id]
+
+    # Binary classification loss with label smoothing
+    class_logits = torch.stack([not_speaking_logit, speaking_logit], dim=1)
+    loss = torch.nn.functional.cross_entropy(
+        class_logits, batch["class_labels"], label_smoothing=args.label_smoothing
+    )
+    loss = loss / args.gradient_accumulation_steps
 ```
 
-**What happens inside `model.thinker(...)`:**
-1. `input_ids` are looked up in the embedding table → vectors
-2. Image tokens are replaced with vision encoder outputs
-3. Audio tokens are replaced with audio encoder outputs
-4. All vectors pass through ~30 transformer layers
-5. At each layer, self-attention runs with LoRA modifications:
-   - `Q = W_q(x) + B_q(A_q(x))` — original + LoRA delta
-   - Same for K, V, O
-6. The model predicts the next token at every position
-7. Cross-entropy loss is computed between predictions and labels
-8. Loss is only computed where labels != -100 (just the "SPEAKING"/"NOT_SPEAKING" tokens)
+**Why logit-based classification?** The standard approach would be to include the answer in the input and compute language modeling loss on the answer tokens. This works but gives weak gradient signal for a binary task — the model is graded on predicting the exact token, not on understanding the task. Logit comparison directly trains the model to make the SPEAKING logit higher than NOT_SPEAKING (or vice versa), which is exactly what we want.
 
-**`autocast`** automatically uses mixed precision — some operations run in 16-bit, others in 32-bit, for speed without losing accuracy.
+**What is `label_smoothing=0.1`?** Instead of telling the model "be 100% sure this is SPEAKING," it tells the model "be 90% confident." This prevents overconfident predictions, reduces the gradient magnitude for near-correct predictions, and acts as regularization — all especially valuable when training on a small dataset (~2000 samples).
 
-**Dividing loss by `gradient_accumulation_steps`**: Since we accumulate gradients from 8 batches before updating, we average the loss so the update magnitude stays the same regardless of accumulation steps.
-
-### 10d: Backward pass
-
-```python
-loss.backward()
-```
-
-PyTorch traces back through every operation in the forward pass and computes: "how much did each LoRA parameter contribute to the loss?" These are the **gradients** — stored in `param.grad` for each trainable parameter.
-
-Frozen parameters (the original 3B weights) are skipped entirely.
-
-### 10e: Gradient accumulation check
+### Gradient accumulation and clipping
 
 ```python
 if (step + 1) % args.gradient_accumulation_steps == 0:
+    torch.nn.utils.clip_grad_norm_(
+        [p for p in model.parameters() if p.requires_grad],
+        args.max_grad_norm,   # 1.0
+    )
+    optimizer.step()
+    scheduler.step()
+    optimizer.zero_grad()
+    global_step += 1
 ```
 
-We only update weights every 8 steps. Steps 1-7 just accumulate gradients (add them up). On step 8, we do the actual update:
+Gradient clipping (max norm = 1.0) prevents catastrophic updates when gradients are large (common in early training or after batch outliers).
 
-### 10f: Gradient clipping
-
-```python
-torch.nn.utils.clip_grad_norm_(
-    [p for p in model.parameters() if p.requires_grad],
-    args.max_grad_norm,   # 1.0
-)
-```
-
-If gradients are very large (exploding gradients), scale them down so the maximum norm is 1.0. Prevents catastrophic weight updates.
-
-### 10g: Optimizer step
-
-```python
-optimizer.step()      # update LoRA weights using accumulated gradients
-scheduler.step()      # adjust learning rate
-optimizer.zero_grad()  # clear gradients for next accumulation cycle
-```
-
-This is where learning actually happens. For each LoRA parameter:
-```
-new_weight = old_weight - learning_rate * gradient
-```
-(AdamW is more sophisticated than this, but that's the basic idea.)
-
-### 10h: Logging
-
-```python
-if global_step % args.logging_steps == 0:
-    avg_loss = total_loss / args.logging_steps
-    progress_bar.set_postfix({"loss": f"{avg_loss:.4f}", ...})
-```
-
-Every 10 optimizer steps, print the average loss. You want to see this number going **down** over time — that means the model is learning.
-
-### 10i: Save checkpoint
-
-```python
-if global_step % args.save_steps == 0:
-    model.thinker.save_pretrained(str(ckpt_dir))
-```
-
-Every 500 steps, save the LoRA weights. If training crashes at step 499, you lose everything. Checkpoints are insurance.
-
-### 10j: End of epoch — save best model
+### Best model saving
 
 ```python
 if avg_epoch_loss < best_loss:
     best_loss = avg_epoch_loss
     model.thinker.save_pretrained(str(best_dir))
+    processor.save_pretrained(str(best_dir))
 ```
 
-After each full pass through the data, if this epoch's loss is the lowest so far, save it as `best_model`. This is the one you'll use for evaluation.
+Saves at the end of each epoch if this epoch's average loss is the lowest so far. The `best_model/` directory is what `evaluate.py` loads by default.
 
 ---
 
-## 11. Save Final Model (Lines 517–542)
+## 9. Save Final Model (Lines 618–638)
 
 ```python
 model.thinker.save_pretrained(str(final_dir))
@@ -456,49 +306,43 @@ processor.save_pretrained(str(final_dir))
 ```
 
 Saves:
-- `adapter_model.safetensors` — the LoRA A and B matrices (~10-50MB)
-- `adapter_config.json` — LoRA configuration (r, alpha, target modules)
-- Processor files — tokenizer and config needed for inference
+- `adapter_model.safetensors` — thinker LoRA A and B matrices (~20-50MB)
+- `adapter_config.json` — LoRA configuration
+- Processor/tokenizer files
 
-**Only LoRA weights are saved**, not the full 3B model. To use later:
+The vision encoder LoRA is saved as part of the thinker's PEFT model (since `model.thinker.visual` is a submodule of `model.thinker`).
+
+To load and use:
 ```python
-# Load original 3B model
 model = Qwen2_5OmniForConditionalGeneration.from_pretrained("Qwen/Qwen2.5-Omni-3B")
-# Add your LoRA adapter on top
 model.thinker = PeftModel.from_pretrained(model.thinker, "output/best_model")
-# Now model has original weights + your fine-tuned adjustments
 ```
-
-```python
-with open(output_dir / "training_log.json", "w") as f:
-    json.dump({"log_history": log_history, ...}, f)
-```
-
-Also saves the full training log (loss at every logging step, total time, etc.) for analysis.
 
 ---
 
 ## Complete Data Flow Summary
 
 ```
-metadata.jsonl (entity_id, image paths, audio path, per-frame labels)
+metadata.jsonl (entity_id, image paths, audio path, majority_label)
     ↓  ASDDataset.__getitem__()
-conversation: "Here are 10 frames + audio. For each frame, is this person speaking?"
-    answer: "Frame 1: SPEAKING\nFrame 2: NOT_SPEAKING\n...\nOverall: SPEAKING"
-    ↓  collate_fn()
+conversation (system + user with 10 images + audio + question)
+    ↓  collate_fn()  [removes assistant message, adds generation prompt]
     ↓  processor.apply_chat_template() → text with special tokens
-    ↓  process_mm_info() → extracts raw images and audio
-    ↓  processor() → tokenizes text, encodes images/audio
-input_ids + attention_mask + labels (tensors of numbers)
+    ↓  process_mm_info() → raw images and audio
+    ↓  processor() → input_ids, attention_mask
+    ↓  class_labels (0 or 1)
     ↓  move to GPU
     ↓  model.thinker() forward pass
-    ↓  embeddings → transformer layers (with LoRA) → predictions
-loss (computed over ~30+ answer tokens — per-frame labels + overall)
+    ↓    vision encoder (LoRA on last 8 layers) → visual embeddings
+    ↓    audio encoder (frozen) → audio embeddings
+    ↓    thinker transformer (LoRA on attention + FFN) → logits
+    ↓  extract logit at last position for SPEAKING and NOT_SPEAKING
+    ↓  cross_entropy(class_logits, labels, label_smoothing=0.1)
     ↓  loss.backward()
-gradients (how to adjust each LoRA parameter)
+    ↓  gradients for thinker LoRA (lr=5e-5) + vision LoRA (lr=1e-5)
     ↓  optimizer.step()
-updated LoRA weights (slightly better at per-frame ASD now)
-    ↓  repeat ~2000 samples × 3 epochs
+updated LoRA weights (better at lip-movement-based ASD)
+    ↓  repeat ~2000 samples × 8 epochs
     ↓  save_pretrained()
-adapter_model.safetensors (the trained LoRA weights, ~10-50MB)
+adapter_model.safetensors (trained LoRA weights, ~20-50MB)
 ```

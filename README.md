@@ -19,14 +19,18 @@ Fine-tune [Qwen2.5-Omni-3B](https://huggingface.co/Qwen/Qwen2.5-Omni-3B) using L
 ├── README.md              # This file
 ├── PROJECT_PLAN.md        # Detailed project plan
 ├── LORA_GUIDE.md          # Step-by-step LoRA explanation
+├── TRAIN_WALKTHROUGH.md   # Line-by-line walkthrough of train_v2.py
 ├── requirements.txt       # Python dependencies
 ├── setup_env.sh           # Conda environment setup for cluster
 ├── prepare_data.py        # Download and subset the dataset
-├── train.py               # LoRA fine-tuning script
+├── train_v2.py            # LoRA fine-tuning script (current — use this)
+├── train.py               # Original training script (v1 — superseded)
 ├── train.sh               # SLURM sbatch job for training
 ├── evaluate.py            # Evaluation with metrics
 └── evaluate.sh            # SLURM sbatch job for evaluation
 ```
+
+> **Use `train_v2.py`** for all training. It adds LoRA on the vision encoder, label smoothing, and improved LoRA hyperparameters over the original `train.py`. See [Changes in v2](#changes-in-v2) for details.
 
 ## Dataset
 
@@ -77,25 +81,55 @@ asd-data/
 
 ### How Data Becomes a Training Sample
 
-The training script reads each metadata line and builds a multimodal conversation for Qwen2.5-Omni. The model must analyze **each frame individually** and output per-frame labels:
+The training script reads each metadata line and builds a multimodal conversation for Qwen2.5-Omni. The model receives 10 face crop images and an audio clip, then predicts a single majority label:
 
 | Role | Content |
 |------|---------|
-| **System** | "You are an active speaker detection system. Analyze each frame..." |
-| **User** | [frame1.jpg] [frame2.jpg] ... [frame10.jpg] [audio.wav] + "For each frame, determine if this person is speaking" |
-| **Assistant** | "Frame 1: SPEAKING\nFrame 2: SPEAKING\nFrame 3: NOT_SPEAKING\n...\nOverall: SPEAKING (6/10 frames)" |
+| **System** | "You are an active speaker detection system." |
+| **User** | [frame1.jpg] ... [frame10.jpg] [audio.wav] + "These are 10 frames of a person's face with audio from the scene. The audio may or may not belong to this person... Is this person speaking? Answer with only SPEAKING or NOT_SPEAKING." |
+| **Assistant** | "SPEAKING" or "NOT_SPEAKING" (majority label) |
 
-This per-frame approach forces the model to actually analyze lip movements and audio at each timestamp, rather than taking shortcuts with a single-token answer.
+Rather than generating the assistant's token via standard language modeling loss, training uses a **logit-based classification loss**: the model's logit for the `SPEAKING` token is compared to the `NOT_SPEAKING` logit at the last position, and binary cross-entropy is applied. This gives clean, direct gradient signal for the classification task.
 
 ## LoRA Configuration
 
+### Thinker (Text LLM)
+
 | Parameter | Value |
 |-----------|-------|
-| Rank (r) | 8 |
-| Alpha | 16 |
+| Rank (r) | 16 |
+| Alpha | 32 |
+| Dropout | 0.1 |
+| Target modules | q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj |
+| Trainable params | ~10M / 3B (~0.3%) |
+
+### Vision Encoder (last 8 layers)
+
+| Parameter | Value |
+|-----------|-------|
+| Rank (r) | 4 |
+| Alpha | 8 |
 | Dropout | 0.05 |
-| Target modules | q_proj, k_proj, v_proj, o_proj |
-| Trainable params | ~3M / 3B (~0.1%) |
+| Target modules | q, k, v (attention) in layers 24–31 |
+| LR scale | 0.2× thinker LR |
+
+## Changes in v2
+
+`train_v2.py` improves on `train.py` in three areas:
+
+**1. Vision encoder LoRA**
+The original script only applied LoRA to the thinker (text LLM). v2 also applies a small-rank LoRA to the last 8 layers of the vision encoder. The model's main failure mode was: *hear audio + see a face → predict SPEAKING*. Fine-tuning the vision encoder helps it learn to distinguish open/moving lips from closed/still ones across the 10 frames.
+
+**2. Label smoothing**
+v2 trains with `label_smoothing=0.1` — soft labels (0.9 / 0.1) instead of hard (1 / 0). This prevents the model from becoming overconfident, acts as regularization, and produces better-calibrated predictions. Especially useful since ASD boundaries can be genuinely ambiguous.
+
+**3. LoRA hyperparameter changes**
+- Rank doubled (8 → 16) for more capacity in the thinker
+- Feed-forward layers (`gate_proj`, `up_proj`, `down_proj`) added to LoRA targets
+- Dropout increased (0.05 → 0.1) to compensate for larger adapter
+- Learning rate lowered (1e-4 → 5e-5) for more stable training
+- Epochs increased (5 → 8) to allow for slower, steadier convergence
+- Separate optimizer param groups: vision encoder uses LR × 0.2 to protect pretrained visual features
 
 ## Running on NEU Explorer Cluster (Step-by-Step)
 
@@ -113,7 +147,7 @@ ssh your_username@login.explorer.northeastern.edu
 sinfo -p gpu --Format=gres:25,gresused:25,nodes:7,cpus:7,nodelist:50
 ```
 
-This shows all GPU types and how many are free. Look for GPUs with available slots (where `GRES_USED` is less than `GRES`). Speed ranking:
+This shows all GPU types and how many are free. Speed ranking:
 
 | GPU | VRAM | Speed | Notes |
 |-----|------|-------|-------|
@@ -122,16 +156,6 @@ This shows all GPU types and how many are free. Look for GPUs with available slo
 | V100-SXM2 | 32GB | Good | Decent fallback |
 | V100-PCIe | 32GB | OK | Slower V100 variant |
 | T4 | 16GB | Slowest | Too small for this model |
-
-Pick the fastest GPU that has free slots, then update `train.sh` and `evaluate.sh` to match. For example, if you pick A100:
-
-```bash
-# In train.sh, the line should be:
-#SBATCH --gres=gpu:a100:1
-
-# In evaluate.sh, same:
-#SBATCH --gres=gpu:a100:1
-```
 
 A100 and H200 support **bf16 natively** (no `--fp16` flag needed). If using V100, add `--fp16` to the python command in `train.sh`.
 
@@ -150,8 +174,6 @@ cd /path/to/fine-tuning-qwen
 scp *.py *.sh *.txt *.md your_username@login.explorer.northeastern.edu:~/qwen-asd/
 ```
 
-This sends only the code files (~60KB), not data. Data gets downloaded directly on the cluster later.
-
 ### Step 5: Set up conda environment
 
 Back in your **SSH session on the cluster**:
@@ -160,18 +182,13 @@ Back in your **SSH session on the cluster**:
 # Request an interactive compute node (don't install on the login node)
 srun --partition=short --mem=8G --time=01:00:00 --pty bash
 
-# Go to your project
 cd ~/qwen-asd
 
-# Load conda and initialize it (first time only)
 module load anaconda3
 conda init
 source ~/.bashrc
 
-# Run the setup script (creates conda env + installs all dependencies)
 bash setup_env.sh
-
-# Activate the environment
 conda activate qwen-asd
 ```
 
@@ -184,13 +201,9 @@ python -c "from transformers import Qwen2_5OmniForConditionalGeneration; print('
 
 ### Step 6: Download and prepare data subset
 
-Still in the interactive session:
-
 ```bash
 python prepare_data.py
 ```
-
-This downloads CSVs + audio + images from HuggingFace and samples ~2,000 training tracks (~5% of data). Takes ~10-30 minutes depending on network speed.
 
 ### Step 7: Submit the training job
 
@@ -199,36 +212,22 @@ sbatch train.sh
 # Output: "Submitted batch job 1234567"
 ```
 
-This puts your job in the SLURM queue. It will run on a GPU node when one becomes available.
-
 ### Step 8: Monitor the job
 
 ```bash
-# Check job status
 squeue -u $USER
 ```
 
-Status codes:
 | Code | Meaning |
 |------|---------|
 | `PD` | Pending — waiting in queue for a GPU |
 | `R` | Running — training is in progress |
 | `CG` | Completing — job is finishing up |
-| (gone) | Job finished (check logs for results) |
-
-The `REASON` column explains why a job is pending:
-- `(Priority)` — other higher-priority jobs are ahead of you
-- `(Resources)` — waiting for the requested GPU type to free up
 
 ```bash
-# Once the job is running (status = R), watch the output live:
-tail -f logs/1234567.out
-
-# Check for errors:
-cat logs/1234567.err
-
-# Cancel a job if needed:
-scancel 1234567
+tail -f logs/1234567.out   # watch output live
+cat logs/1234567.err       # check for errors
+scancel 1234567            # cancel if needed
 ```
 
 The first thing the training script does is a **50-step timing test** that estimates total training time. If it says >4 hours, cancel and reduce data.
@@ -239,13 +238,7 @@ The first thing the training script does is a **50-step timing test** that estim
 sbatch evaluate.sh
 ```
 
-This runs evaluation twice: once with the LoRA adapter (fine-tuned model) and once without (baseline), so you can compare the improvement.
-
 ```bash
-# Check eval results when done:
-cat logs/<eval_job_id>.out
-
-# Or read the JSON results:
 cat output/eval_results.json
 ```
 
@@ -256,10 +249,8 @@ squeue -u $USER              # list your jobs
 sinfo -p gpu                 # see GPU partition info
 scancel <job_id>             # cancel a job
 cat logs/<job_id>.out        # view job output
-cat logs/<job_id>.err        # view job errors
 tail -f logs/<job_id>.out    # follow output live (Ctrl+C to stop)
 nvidia-smi                   # check GPU usage (on compute node)
-du -sh ~/qwen-asd/data/      # check data size
 ```
 
 ---
@@ -267,27 +258,24 @@ du -sh ~/qwen-asd/data/      # check data size
 ## Training Details
 
 - **Model:** Qwen2.5-Omni-3B (3 billion parameters, multimodal)
-- **Method:** LoRA via PEFT library applied to the thinker component
+- **Method:** LoRA via PEFT on thinker + vision encoder last 8 layers
 - **GPU:** A100 40GB (bf16) — also works on V100 32GB (fp16) or H200
-- **Effective batch size:** 8 (batch_size=1 x gradient_accumulation=8)
-- **Epochs:** 3
-- **Learning rate:** 2e-4 with linear warmup
+- **Effective batch size:** 8 (batch_size=1 × gradient_accumulation=8)
+- **Epochs:** 8
+- **Learning rate:** 5e-5 (thinker), 1e-5 (vision encoder) with linear warmup
+- **Label smoothing:** 0.1
 - **Estimated training time:** ~2-4 hours on A100
-
-The training script includes a **50-step timing test** at startup that estimates total training time before committing to the full run.
 
 ## Evaluation Metrics
 
-**Per-frame metrics (primary):**
-- Frame Accuracy, Precision, Recall, F1 Score
-- Frame mAP (mean Average Precision)
-- Frame Confusion Matrix
+- **Accuracy** — % of correct predictions
+- **Precision** — of all predicted SPEAKING, how many were actually speaking
+- **Recall** — of all actually speaking, how many were caught
+- **F1 Score** — harmonic mean of precision and recall
+- **mAP** — mean Average Precision (area under the PR curve)
+- **Confusion Matrix** — 2×2 grid of true/false positives and negatives
 
-**Track-level metrics:**
-- Track mAP — AP per entity track, averaged (standard ASD metric)
-- Track Accuracy, F1
-
-**Baseline comparison:** evaluates the model both with and without LoRA adapter to measure improvement over the base model.
+**Baseline comparison:** the evaluation script runs both with and without the LoRA adapter to measure improvement over the base model.
 
 ## References
 
