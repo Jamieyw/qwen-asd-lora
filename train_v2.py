@@ -41,12 +41,12 @@ def parse_args():
     p.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-Omni-3B")
     p.add_argument("--data_dir", type=str, default="./data")
     p.add_argument("--output_dir", type=str, default="./output")
-    p.add_argument("--epochs", type=int, default=5)
+    p.add_argument("--epochs", type=int, default=8)
     p.add_argument("--batch_size", type=int, default=1,
                    help="Batch size per GPU (1 for multimodal, use grad accum for effective batch)")
     p.add_argument("--gradient_accumulation_steps", type=int, default=8)
-    p.add_argument("--learning_rate", type=float, default=1e-4)
-    p.add_argument("--warmup_steps", type=int, default=50)
+    p.add_argument("--learning_rate", type=float, default=5e-5)
+    p.add_argument("--warmup_steps", type=int, default=100)
     p.add_argument("--weight_decay", type=float, default=0.01)
     p.add_argument("--max_grad_norm", type=float, default=1.0)
     p.add_argument("--lora_r", type=int, default=16)
@@ -56,8 +56,8 @@ def parse_args():
                    help="Label smoothing factor (0.0 = hard labels, 0.1 = recommended)")
     p.add_argument("--unfreeze_audio_layers", type=int, default=8,
                    help="Number of audio encoder layers to apply LoRA to (from the end, 0 to disable)")
-    p.add_argument("--audio_lr_scale", type=float, default=0.1,
-                   help="Audio encoder LR = learning_rate * this scale (default: 0.1)")
+    p.add_argument("--audio_lr_scale", type=float, default=0.2,
+                   help="Audio encoder LR = learning_rate * this scale (default: 0.2)")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--logging_steps", type=int, default=10)
     p.add_argument("--save_steps", type=int, default=500)

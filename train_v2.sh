@@ -65,17 +65,17 @@ python train_v2.py \
     --model_name "Qwen/Qwen2.5-Omni-3B" \
     --data_dir ./asd-data \
     --output_dir ./output \
-    --epochs 5 \
+    --epochs 8 \
     --batch_size 1 \
     --gradient_accumulation_steps 8 \
-    --learning_rate 1e-4 \
-    --warmup_steps 50 \
+    --learning_rate 5e-5 \
+    --warmup_steps 100 \
     --lora_r 16 \
     --lora_alpha 32 \
     --lora_dropout 0.1 \
     --label_smoothing 0.1 \
     --unfreeze_audio_layers 8 \
-    --audio_lr_scale 0.1 \
+    --audio_lr_scale 0.2 \
     --logging_steps 10 \
     --save_steps 500 \
     --timing_test_steps 50 \
