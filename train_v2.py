@@ -3,10 +3,11 @@ train_v2.py — Improved LoRA fine-tuning of Qwen2.5-Omni-3B for Active Speaker 
 
 Changes from train.py:
   - Label smoothing (default 0.1) to prevent overconfident predictions
-  - LoRA on audio encoder last N layers (default 8) with lower LR
+  - LoRA on vision encoder last N layers (default 8) with lower LR
+    (vision encoder learns lip movement features for ASD)
   - Updated hyperparameters: higher rank (16), lower LR (5e-5), more dropout (0.1)
   - LoRA targets feed-forward layers too (gate_proj, up_proj, down_proj)
-  - Separate optimizer parameter groups for thinker vs audio encoder
+  - Separate optimizer parameter groups for thinker vs vision encoder
 
 Usage:
     python train_v2.py [--data_dir ./data] [--output_dir ./output] [--epochs 3]
@@ -54,10 +55,10 @@ def parse_args():
     p.add_argument("--lora_dropout", type=float, default=0.1)
     p.add_argument("--label_smoothing", type=float, default=0.1,
                    help="Label smoothing factor (0.0 = hard labels, 0.1 = recommended)")
-    p.add_argument("--unfreeze_audio_layers", type=int, default=8,
-                   help="Number of audio encoder layers to apply LoRA to (from the end, 0 to disable)")
-    p.add_argument("--audio_lr_scale", type=float, default=0.2,
-                   help="Audio encoder LR = learning_rate * this scale (default: 0.2)")
+    p.add_argument("--unfreeze_vision_layers", type=int, default=8,
+                   help="Number of vision encoder layers to apply LoRA to (from the end, 0 to disable)")
+    p.add_argument("--vision_lr_scale", type=float, default=0.2,
+                   help="Vision encoder LR = learning_rate * this scale (default: 0.2)")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--logging_steps", type=int, default=10)
     p.add_argument("--save_steps", type=int, default=500)
@@ -266,64 +267,73 @@ def run_timing_test(model, dataloader, device, num_steps, speaking_token_id, not
     return per_step
 
 
-def setup_audio_encoder_lora(model, args):
+def setup_vision_encoder_lora(model, args):
     """
-    Apply LoRA to the last N layers of the audio encoder.
+    Apply LoRA to the last N layers of the vision encoder.
 
-    The audio encoder (model.thinker.audio_tower) has 32 transformer layers
-    with standard q_proj/k_proj/v_proj attention projections.
+    The vision encoder (model.thinker.visual) has 32 transformer layers.
+    Vision attention uses short names: q, k, v (not q_proj, k_proj, v_proj).
     We apply a small-rank LoRA to the last few layers so the encoder
-    can learn to extract ASD-relevant audio features while preserving
+    can learn to extract lip movement features for ASD, while preserving
     pretrained representations in early layers.
+
+    This is more important than audio encoder LoRA for ASD because the
+    model's main failure mode is: it hears audio + sees a face → defaults
+    to SPEAKING. The vision encoder needs to learn that lip state (open vs
+    closed, movement across frames) matters for determining who is speaking.
     """
-    if args.unfreeze_audio_layers <= 0:
-        print("Audio encoder LoRA: disabled")
+    if args.unfreeze_vision_layers <= 0:
+        print("Vision encoder LoRA: disabled")
         return
 
-    total_audio_layers = 32
-    start_layer = total_audio_layers - args.unfreeze_audio_layers
+    total_vision_layers = 32
+    start_layer = total_vision_layers - args.unfreeze_vision_layers
 
-    # Build target module list for last N layers
-    audio_target_modules = []
-    for i in range(start_layer, total_audio_layers):
-        audio_target_modules.extend([
-            f"layers.{i}.self_attn.q_proj",
-            f"layers.{i}.self_attn.k_proj",
-            f"layers.{i}.self_attn.v_proj",
+    # Vision encoder uses short attention names: q, k, v (not q_proj, k_proj, v_proj)
+    # Layer path: blocks.{i}.attn.q / blocks.{i}.attn.k / blocks.{i}.attn.v
+    # NOTE: If this fails, run on cluster to check exact names:
+    #   for n, _ in model.thinker.visual.named_modules():
+    #       if any(x in n for x in ['.q', '.k', '.v']): print(n)
+    vision_target_modules = []
+    for i in range(start_layer, total_vision_layers):
+        vision_target_modules.extend([
+            f"blocks.{i}.attn.q",
+            f"blocks.{i}.attn.k",
+            f"blocks.{i}.attn.v",
         ])
 
-    audio_lora_config = LoraConfig(
+    vision_lora_config = LoraConfig(
         r=4,
         lora_alpha=8,
         lora_dropout=0.05,
-        target_modules=audio_target_modules,
+        target_modules=vision_target_modules,
         bias="none",
     )
 
-    print(f"\nApplying LoRA to audio encoder (last {args.unfreeze_audio_layers} of {total_audio_layers} layers)...")
-    print(f"  Audio LoRA targets: layers {start_layer}-{total_audio_layers - 1}, q/k/v_proj")
-    print(f"  Audio LoRA rank: 4, alpha: 8")
+    print(f"\nApplying LoRA to vision encoder (last {args.unfreeze_vision_layers} of {total_vision_layers} layers)...")
+    print(f"  Vision LoRA targets: layers {start_layer}-{total_vision_layers - 1}, q/k/v")
+    print(f"  Vision LoRA rank: 4, alpha: 8")
 
-    model.thinker.audio_tower = get_peft_model(model.thinker.audio_tower, audio_lora_config)
-    model.thinker.audio_tower.print_trainable_parameters()
+    model.thinker.visual = get_peft_model(model.thinker.visual, vision_lora_config)
+    model.thinker.visual.print_trainable_parameters()
 
 
 def build_optimizer(model, args):
     """
-    Build optimizer with separate parameter groups for thinker and audio encoder.
+    Build optimizer with separate parameter groups for thinker and vision encoder.
 
-    The audio encoder uses a lower learning rate (default 10x lower) since
-    we want to make small adjustments to pretrained audio features, not
-    overwrite them.
+    The vision encoder uses a lower learning rate since we want to make
+    small adjustments to pretrained visual features (learn lip movement
+    detection), not overwrite them.
     """
     thinker_params = []
-    audio_params = []
+    vision_params = []
 
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if "audio_tower" in name:
-            audio_params.append(param)
+        if "visual" in name:
+            vision_params.append(param)
         else:
             thinker_params.append(param)
 
@@ -331,12 +341,12 @@ def build_optimizer(model, args):
         {"params": thinker_params, "lr": args.learning_rate},
     ]
 
-    if audio_params:
-        audio_lr = args.learning_rate * args.audio_lr_scale
-        param_groups.append({"params": audio_params, "lr": audio_lr})
+    if vision_params:
+        vision_lr = args.learning_rate * args.vision_lr_scale
+        param_groups.append({"params": vision_params, "lr": vision_lr})
         print(f"\nOptimizer parameter groups:")
         print(f"  Thinker: {len(thinker_params)} params, lr={args.learning_rate}")
-        print(f"  Audio encoder: {len(audio_params)} params, lr={audio_lr}")
+        print(f"  Vision encoder: {len(vision_params)} params, lr={vision_lr}")
     else:
         print(f"\nOptimizer: {len(thinker_params)} trainable params, lr={args.learning_rate}")
 
@@ -404,9 +414,9 @@ def train(args):
     model.thinker.print_trainable_parameters()
 
     # -----------------------------------------------------------------------
-    # Apply LoRA to audio encoder last layers
+    # Apply LoRA to vision encoder last layers
     # -----------------------------------------------------------------------
-    setup_audio_encoder_lora(model, args)
+    setup_vision_encoder_lora(model, args)
 
     if args.gradient_checkpointing:
         model.thinker.enable_input_require_grads()
@@ -484,10 +494,10 @@ def train(args):
     print(f"  Gradient accumulation: {args.gradient_accumulation_steps}")
     print(f"  Effective batch size: {args.batch_size * args.gradient_accumulation_steps}")
     print(f"  Learning rate: {args.learning_rate}")
-    print(f"  Audio encoder LR: {args.learning_rate * args.audio_lr_scale}")
+    print(f"  Vision encoder LR: {args.learning_rate * args.vision_lr_scale}")
     print(f"  Label smoothing: {args.label_smoothing}")
     print(f"  LoRA rank: {args.lora_r}, alpha: {args.lora_alpha}, dropout: {args.lora_dropout}")
-    print(f"  Audio encoder LoRA layers: {args.unfreeze_audio_layers}")
+    print(f"  Vision encoder LoRA layers: {args.unfreeze_vision_layers}")
     print(f"  Total optimizer steps: {optimizer_steps}")
     print("=" * 60)
 

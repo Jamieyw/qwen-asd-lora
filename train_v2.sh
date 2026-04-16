@@ -58,7 +58,7 @@ nvidia-smi
 
 echo ""
 echo "========================================"
-echo "Starting training (v2 — label smoothing + audio encoder LoRA)..."
+echo "Starting training (v2 — label smoothing + vision encoder LoRA)..."
 echo "========================================"
 
 python train_v2.py \
@@ -74,8 +74,8 @@ python train_v2.py \
     --lora_alpha 32 \
     --lora_dropout 0.1 \
     --label_smoothing 0.1 \
-    --unfreeze_audio_layers 8 \
-    --audio_lr_scale 0.2 \
+    --unfreeze_vision_layers 8 \
+    --vision_lr_scale 0.2 \
     --logging_steps 10 \
     --save_steps 500 \
     --timing_test_steps 50 \
